@@ -17,10 +17,9 @@ class AuthManager:
         try:
             payload = {
                 "sub": user["id"],
-                "exp": datetime.utcnow() + timedelta(minutes=120)
+                "exp": datetime.utcnow() + timedelta(minutes=120),
             }
-            return jwt.encode(payload, config("SECRET_KEY"),
-                              algorithm="HS256")
+            return jwt.encode(payload, config("SECRET_KEY"), algorithm="HS256")
             # ES256 https://curity.io/resources/learn/jwt-best-practices/#:~:text=When%20signing%20is%20considered%2C%20currently,v1_5%20using%20SHA%2D256)
             # pip install pyjwt[crypto]
         except Exception as ex:
@@ -30,21 +29,25 @@ class AuthManager:
 
 class CustomHTTPBearer(HTTPBearer):
     async def __call__(
-            self, request: Request
+        self, request: Request
     ) -> Optional[HTTPAuthorizationCredentials]:
         res = await super().__call__(request)
 
         try:
-            payload = jwt.decode(res.credentials, config("SECRET_KEY"), algorithms=["HS256"])
-            user_data = await database.fetch_one(user.select().where(user.c.id == payload["sub"]))
+            payload = jwt.decode(
+                res.credentials, config("SECRET_KEY"), algorithms=["HS256"]
+            )
+            user_data = await database.fetch_one(
+                user.select().where(user.c.id == payload["sub"])
+            )
             request.state.user = user_data  # same like the User Mixin
         except jwt.ExpiredSignatureError:
             raise HTTPException(401, "Token is expired")
         except jwt.InvalidTokenError:
             raise HTTPException(401, "Invalid Token")
 
-oauth2_scheme=CustomHTTPBearer()
 
+oauth2_scheme = CustomHTTPBearer()
 
 
 def is_complainer(request: Request):

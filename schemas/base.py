@@ -7,5 +7,6 @@ class BaseComplaint(BaseModel):
     photo_url: str
     amount: float
 
+
 class BaseUser(BaseModel):
     email: str
