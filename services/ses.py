@@ -14,7 +14,7 @@ class SESService:
         )
 
     def send_mail(self, subject, to_addresses, text_data):
-        body = ({"Text": {"Data": text_data, "Charset": "UTF-8"}})
+        body = {"Text": {"Data": text_data, "Charset": "UTF-8"}}
         try:
             self.ses.send_email(
                 Source="edmundcyh@gmail.com",

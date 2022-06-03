@@ -50,7 +50,6 @@ class ComplaintManager:
             "Your complaint is approved",
             ["me.exist87@gmail.com"],
             "Congrats! You complaint is approved. Please check your bank account after 2 business days to verify the claimed amount is there.\n King regards!",
-
         )
 
     @staticmethod
