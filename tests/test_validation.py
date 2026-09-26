@@ -88,13 +88,26 @@ def test_check_email_keeps_value():
 def test_database_url_quotes_credentials(monkeypatch):
     import db
 
-    monkeypatch.setenv("DATABASE_URL", "")
-    monkeypatch.setenv("DB_USER", "app")
-    monkeypatch.setenv("DB_PASSWORD", "p@ss:w/rd%")
-    monkeypatch.setenv("DB_HOST", "db.internal")
+    # Set every part explicitly so a developer's .env can't interfere
+    for name, value in {
+        "DATABASE_URL": "",
+        "DB_USER": "app user",
+        "DB_PASSWORD": "p@ss:w/rd%",
+        "DB_HOST": "db.internal",
+        "DB_PORT": "6543",
+        "DB_NAME": "complaints",
+    }.items():
+        monkeypatch.setenv(name, value)
 
     url = make_url(db._database_url())
 
+    assert url.username == "app user"
     assert url.password == "p@ss:w/rd%"
-    assert url.host == "db.internal"
-    assert url.database == "complaints"
+    assert (url.host, url.port, url.database) == ("db.internal", 6543, "complaints")
+
+
+def test_database_url_accepts_postgres_scheme(monkeypatch):
+    import db
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@host:5432/name")
+    assert db._database_url() == "postgresql://u:p@host:5432/name"

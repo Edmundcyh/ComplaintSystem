@@ -1,6 +1,7 @@
 import bcrypt
 from asyncpg import UniqueViolationError
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from db import database
 from managers.auth import AuthManager
@@ -24,7 +25,10 @@ def verify_password(password, password_hash):
 class UserManager:
     @staticmethod
     async def register(user_data):
-        user_data["password"] = hash_password(user_data["password"])
+        # bcrypt is slow on purpose; keep it off the event loop
+        user_data["password"] = await run_in_threadpool(
+            hash_password, user_data["password"]
+        )
         try:
             id_ = await database.execute(user.insert().values(**user_data))
         except UniqueViolationError:
@@ -39,7 +43,9 @@ class UserManager:
         )
         if not user_do:
             raise HTTPException(400, "Wrong email or password")
-        elif not verify_password(user_data["password"], user_do["password"]):
+        elif not await run_in_threadpool(
+            verify_password, user_data["password"], user_do["password"]
+        ):
             raise HTTPException(400, "Wrong email or password")
         return AuthManager.encode_token(user_do), user_do["role"]
 

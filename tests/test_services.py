@@ -73,12 +73,37 @@ def test_wise_fund_completed(monkeypatch):
     assert run(service.fund_transfer(99))["status"] == "COMPLETED"
 
 
-def test_wise_unexpected_status_is_logged(monkeypatch, caplog):
-    service = wise(lambda request: httpx.Response(401, text="bad token"), monkeypatch)
+def test_wise_errors_are_logged_without_personal_data(monkeypatch, caplog):
+    body = {
+        "errors": [
+            {
+                "code": "NOT_VALID",
+                "message": "IBAN DE89370400440532013000 is not valid",
+                "arguments": ["Jane Doe", "DE89370400440532013000"],
+            }
+        ]
+    }
+    service = wise(lambda request: httpx.Response(422, json=body), monkeypatch)
     with pytest.raises(HTTPException) as ex:
         run(service.cancel_transfer(99))
     assert ex.value.status_code == 502
-    assert "bad token" in caplog.text
+    assert "NOT_VALID" in caplog.text
+    assert "DE89" not in caplog.text and "Jane" not in caplog.text
+
+
+def test_wise_invalid_json_is_502(monkeypatch):
+    service = wise(lambda request: httpx.Response(200, text="<html>"), monkeypatch)
+    with pytest.raises(HTTPException) as ex:
+        run(service.get_transfer_status(99))
+    assert ex.value.status_code == 502
+
+
+def test_wise_transfer_status(monkeypatch):
+    def handler(request):
+        assert request.url.path == "/v1/transfers/99"
+        return httpx.Response(200, json={"id": 99, "status": "processing"})
+
+    assert run(wise(handler, monkeypatch).get_transfer_status(99)) == "processing"
 
 
 def test_wise_network_error(monkeypatch):

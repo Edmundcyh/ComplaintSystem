@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from managers.auth import oauth2_scheme, is_admin
 from managers.user import UserManager
 from models import RoleType
+from resources.params import Id
 from schemas.response.user import UserOut
 
 router = APIRouter(tags=["Users"])
@@ -26,7 +27,7 @@ async def get_user(email: Optional[str] = None):
     dependencies=[Depends(oauth2_scheme), Depends(is_admin)],
     status_code=204,
 )
-async def make_admin(user_id: int):
+async def make_admin(user_id: Id):
     await UserManager.change_role(RoleType.admin, user_id)
 
 
@@ -35,5 +36,5 @@ async def make_admin(user_id: int):
     dependencies=[Depends(oauth2_scheme), Depends(is_admin)],
     status_code=204,
 )
-async def make_approver(user_id: int):
+async def make_approver(user_id: Id):
     await UserManager.change_role(RoleType.approver, user_id)

@@ -33,6 +33,9 @@ All settings are described in [`.env.example`](.env.example). Generate
 `SECRET_KEY` with something like
 `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
+The AWS user needs `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on the
+bucket, and `ses:SendEmail` for the sender address.
+
 ## Running
 
 ```bash
@@ -69,19 +72,35 @@ Admins can then promote other users with `PUT /users/{id}/make-approver` or
 
 Send the token as `Authorization: Bearer <token>`; tokens last 2 hours.
 
-A complaint needs `title`, `description`, `amount` (more than 0, at most 2
-decimals), `encoded_photo` (base64, up to 5 MB) and `extension` (`jpg`,
-`jpeg`, `png` or `webp`, matching the photo). Only pending complaints can be
-approved or rejected; anything else returns `409`.
+Send JSON with `Content-Type: application/json`; request bodies are limited
+to 8 MB. A complaint needs `title` (up to 120 characters), `description` (up
+to 5000), `amount` (more than 0, at most 2 decimals), `encoded_photo` (base64,
+up to 5 MB) and `extension` (`jpg`, `jpeg`, `png` or `webp`, matching the
+photo). Only pending complaints can be approved or rejected; anything else
+returns `409`.
 
 `photo_url` in responses is a presigned S3 link that expires after one hour,
 so fetch complaints again rather than storing it. (Photos uploaded before this
 change were public and stay that way.)
 
+## Upgrading an existing installation
+
+- Add `SES_SENDER_EMAIL` to `.env` (the sender used to be hard-coded). Without
+  it approvals still work, but no email is sent and an error is logged.
+- Give the AWS user the permissions listed under [Setup](#setup).
+- Run `alembic upgrade head`. It converts amounts to exact decimals (rounded
+  to 2 places) and stops with a list of rows if any amount is too large
+  (100,000,000 or more) or not a number; correct those and run it again.
+- Everyone has to log in again: tokens issued by the old version are no longer
+  accepted.
+- Clients must send `Content-Type: application/json` (Angular's `HttpClient`
+  already does).
+
 ## Tests
 
 The tests need a PostgreSQL database they are allowed to wipe. They never use
-the database from `.env`; point them at a separate one:
+the database from `.env`, and refuse to run unless the database name contains
+`test`:
 
 ```bash
 createdb complaints_test
@@ -98,6 +117,11 @@ are needed. The same checks (`black --check .` and `pytest` on Python
 
 - Use `https://api.wise-sandbox.com` while testing; the old
   `api.sandbox.transferwise.tech` host has been retired.
+- Before paying or cancelling, the app asks Wise for the transfer's status.
+  This makes retries safe (a payment whose response was lost isn't made
+  twice) and replaces transfers that Wise cancelled because they stayed
+  unfunded for about two weeks. Transfers in any other unexpected state are
+  reported with `409` and need to be handled in Wise.
 - Wise's documentation says transfers can't be funded through the API with a
   personal token for EU/UK profiles (PSD2/SCA). Check this against your
   account before relying on automatic payouts in production.

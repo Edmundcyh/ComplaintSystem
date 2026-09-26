@@ -5,6 +5,8 @@ from fastapi import HTTPException
 
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
 ALLOWED_PHOTO_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+# Line breaks are common in base64 output; strict decoding rejects them
+_STRIP_WHITESPACE = str.maketrans("", "", " \t\r\n")
 
 
 def _detect_image_type(data):
@@ -23,7 +25,9 @@ def decode_photo(encoded_string, extension):
     Returns the photo bytes and their content type.
     """
     try:
-        data = base64.b64decode("".join(encoded_string.split()), validate=True)
+        data = base64.b64decode(
+            encoded_string.translate(_STRIP_WHITESPACE), validate=True
+        )
     except (binascii.Error, ValueError):
         raise HTTPException(400, "Invalid photo encoding")
     if len(data) > MAX_PHOTO_BYTES:

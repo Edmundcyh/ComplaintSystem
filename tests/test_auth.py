@@ -105,3 +105,21 @@ def test_bad_tokens_get_401(client, make_user):
         assert resp.status_code == 401, name
     resp = client.get("/complaints/", headers={"Authorization": f"Bearer {expired}"})
     assert resp.json()["detail"] == "Token is expired"
+
+
+def test_numbers_accepted_for_text_fields(client, engine):
+    # pydantic v1 turned numbers into strings; keep accepting them
+    assert register(client, phone=359888123456, password=12345678).status_code == 201
+    resp = client.post(
+        "/login/", json={"email": "new@example.com", "password": 12345678}
+    )
+    assert resp.status_code == 200
+    with engine.begin() as conn:
+        phone = conn.execute(sa.text("SELECT phone FROM users")).scalar_one()
+    assert phone == "359888123456"
+
+
+def test_validation_errors_do_not_echo_passwords(client):
+    resp = register(client, password="Pw9#xyz")
+    assert resp.status_code == 422
+    assert "Pw9#xyz" not in resp.text

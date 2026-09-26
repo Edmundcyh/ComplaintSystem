@@ -73,9 +73,23 @@ def test_photo_validation(client, make_user):
     assert post(encoded_photo=not_image).status_code == 400
     # PNG bytes sent as a jpg
     assert post(extension="jpg").status_code == 400
-    assert post(encoded_photo="A" * (11 * 1024 * 1024)).status_code == 422
+    # Bodies over the 8 MB request limit are refused before parsing
+    assert post(encoded_photo="A" * (9 * 1024 * 1024)).status_code == 413
     # Extension is normalised
     assert post(extension=".PNG").status_code == 200
+
+
+def test_text_limits_and_validation_errors(client, make_user):
+    user = make_user()
+    resp = client.post(
+        "/complaints/",
+        json=complaint_body(description="x" * 5001, extension="exe"),
+        headers=user["headers"],
+    )
+    assert resp.status_code == 422
+    assert {e["loc"][-1] for e in resp.json()["detail"]} == {"description", "extension"}
+    # Submitted values are not echoed back
+    assert all("input" not in e for e in resp.json()["detail"])
 
 
 def test_wise_failure_removes_uploaded_photo(client, engine, fakes, make_user):
@@ -356,3 +370,147 @@ def test_delete_unknown_and_permissions(client, make_user, create_complaint):
     )
     resp = client.delete(f"/complaints/{complaint['id']}/", headers=user["headers"])
     assert resp.status_code == 403
+
+
+def test_ids_outside_the_database_range(client, make_user):
+    approver, admin = make_user("approver"), make_user("admin")
+    too_big = 2**31
+    assert (
+        client.put(
+            f"/complaints/{too_big}/approve", headers=approver["headers"]
+        ).status_code
+        == 422
+    )
+    assert (
+        client.delete(f"/complaints/{too_big}/", headers=admin["headers"]).status_code
+        == 422
+    )
+    assert (
+        client.put(f"/users/{too_big}/make-admin", headers=admin["headers"]).status_code
+        == 422
+    )
+
+
+# --- Wise state reconciliation ---------------------------------------------
+
+
+def test_approve_retry_after_lost_funding_response(
+    client, engine, fakes, make_user, create_complaint
+):
+    # Wise funded the transfer but the answer never arrived
+    user, approver = make_user(), make_user("approver")
+    complaint = create_complaint(user)
+    url = f"/complaints/{complaint['id']}/approve"
+    fakes.wise.fund_response_lost = True
+
+    assert client.put(url, headers=approver["headers"]).status_code == 502
+    [row] = get_row(engine, "SELECT status FROM complaints")
+    assert row["status"] == "pending"
+
+    # Retrying records the approval without paying a second time
+    assert client.put(url, headers=approver["headers"]).status_code == 204
+    [row] = get_row(engine, "SELECT status FROM complaints")
+    assert row["status"] == "approved"
+    assert len(fakes.wise.funded) == 1
+    assert fakes.ses.sent == [("Your complaint is approved", [user["email"]])]
+
+
+def test_paid_complaint_cannot_be_rejected_or_deleted(
+    client, fakes, make_user, create_complaint
+):
+    user, approver, admin = make_user(), make_user("approver"), make_user("admin")
+    complaint = create_complaint(user)
+    fakes.wise.fund_response_lost = True
+    client.put(f"/complaints/{complaint['id']}/approve", headers=approver["headers"])
+
+    resp = client.put(
+        f"/complaints/{complaint['id']}/reject", headers=approver["headers"]
+    )
+    assert resp.status_code == 409
+    assert "approve the complaint instead" in resp.json()["detail"]
+    resp = client.delete(f"/complaints/{complaint['id']}/", headers=admin["headers"])
+    assert resp.status_code == 409
+    assert fakes.wise.cancelled == []
+
+
+def test_approve_replaces_expired_transfer(
+    client, engine, fakes, make_user, create_complaint
+):
+    user, approver = make_user(), make_user("approver")
+    complaint = create_complaint(user, amount="20.00")
+    [old] = get_row(engine, "SELECT id, transfer_id FROM transactions")
+    fakes.wise.statuses[old["transfer_id"]] = "cancelled"  # expired at Wise
+
+    resp = client.put(
+        f"/complaints/{complaint['id']}/approve", headers=approver["headers"]
+    )
+
+    assert resp.status_code == 204
+    [new] = get_row(engine, "SELECT id, transfer_id, amount FROM transactions")
+    assert new["id"] == old["id"]
+    assert new["transfer_id"] != old["transfer_id"]
+    assert new["amount"] == Decimal("20.00")
+    assert fakes.wise.funded == [new["transfer_id"]]
+    assert fakes.wise.quotes == [Decimal("20.00"), Decimal("20.00")]
+
+
+def test_approve_with_unexpected_transfer_state(
+    client, engine, fakes, make_user, create_complaint
+):
+    user, approver = make_user(), make_user("approver")
+    complaint = create_complaint(user)
+    [tx] = get_row(engine, "SELECT transfer_id FROM transactions")
+    fakes.wise.statuses[tx["transfer_id"]] = "bounced_back"
+
+    resp = client.put(
+        f"/complaints/{complaint['id']}/approve", headers=approver["headers"]
+    )
+
+    assert resp.status_code == 409
+    assert "bounced_back" in resp.json()["detail"]
+    assert fakes.wise.funded == []
+
+
+def test_reject_and_delete_when_wise_already_cancelled(
+    client, engine, fakes, make_user, create_complaint
+):
+    user, approver, admin = make_user(), make_user("approver"), make_user("admin")
+    rejected = create_complaint(user)
+    deleted = create_complaint(user)
+    for tx in get_row(engine, "SELECT transfer_id FROM transactions"):
+        fakes.wise.statuses[tx["transfer_id"]] = "cancelled"
+
+    resp = client.put(
+        f"/complaints/{rejected['id']}/reject", headers=approver["headers"]
+    )
+    assert resp.status_code == 204
+    resp = client.delete(f"/complaints/{deleted['id']}/", headers=admin["headers"])
+    assert resp.status_code == 204
+    assert fakes.wise.cancelled == []
+
+
+def test_missing_email_settings_do_not_block_approval(
+    client, engine, fakes, make_user, create_complaint, monkeypatch, caplog
+):
+    import services.ses
+    from decouple import UndefinedValueError
+
+    from main import app
+    from services.ses import SESService, get_ses_service
+
+    def missing(name, *args, **kwargs):
+        raise UndefinedValueError(f"{name} not found")
+
+    monkeypatch.setattr(services.ses, "config", missing)
+    app.dependency_overrides[get_ses_service] = SESService
+    user, approver = make_user(), make_user("approver")
+    complaint = create_complaint(user)
+
+    resp = client.put(
+        f"/complaints/{complaint['id']}/approve", headers=approver["headers"]
+    )
+
+    assert resp.status_code == 204
+    [row] = get_row(engine, "SELECT status FROM complaints")
+    assert row["status"] == "approved"
+    assert "Failed to send approval email" in caplog.text

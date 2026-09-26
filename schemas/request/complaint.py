@@ -8,6 +8,7 @@ from utils.helpers import ALLOWED_PHOTO_EXTENSIONS, MAX_PHOTO_BYTES
 
 class ComplaintIn(BaseComplaint):
     title: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=5000)
     amount: Annotated[Money, Field(gt=0, max_digits=10, decimal_places=2)]
     # Generous bound to reject huge bodies early; the decoded size is
     # checked exactly in decode_photo

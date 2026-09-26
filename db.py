@@ -7,6 +7,9 @@ from decouple import config
 
 def _database_url():
     url = config("DATABASE_URL", default="")
+    if url.startswith("postgres://"):
+        # Heroku-style scheme: asyncpg accepts it, SQLAlchemy/Alembic don't
+        url = "postgresql://" + url[len("postgres://") :]
     if url:
         return url
     # Quoted so passwords with characters like @ : / % work

@@ -8,7 +8,30 @@ from fastapi import HTTPException
 
 REQUEST_TIMEOUT = 10  # seconds
 
+# Wise transfer statuses (GET /v1/transfers/{id})
+UNFUNDED = "incoming_payment_waiting"
+CANCELLED = "cancelled"
+FUNDED = {"processing", "funds_converted", "outgoing_payment_sent"}
+
 logger = logging.getLogger(__name__)
+
+
+def _error_summary(resp):
+    # Wise error bodies can echo the request (IBAN, account holder name),
+    # so only the error codes are logged
+    try:
+        body = resp.json()
+    except ValueError:
+        return f"{len(resp.content)} byte non-JSON body"
+    if isinstance(body, dict):
+        if isinstance(body.get("errors"), list):
+            return ", ".join(
+                str(e.get("code")) for e in body["errors"] if isinstance(e, dict)
+            )
+        for key in ("errorCode", "error", "code"):
+            if key in body:
+                return str(body[key])
+    return "no error code"
 
 
 class WiseService:
@@ -40,10 +63,14 @@ class WiseService:
                 method,
                 path,
                 resp.status_code,
-                resp.text,
+                _error_summary(resp),
             )
             raise HTTPException(502, "Payment provider is not available at the moment")
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError:
+            logger.error("Wise request %s %s returned invalid JSON", method, path)
+            raise HTTPException(502, "Payment provider is not available at the moment")
 
     async def get_profile_id(self):
         # Looked up on first use so the app can start without reaching Wise
@@ -89,6 +116,10 @@ class WiseService:
         }
         resp = await self._request("POST", "/v1/transfers", 200, json=data)
         return resp["id"]
+
+    async def get_transfer_status(self, transfer_id):
+        resp = await self._request("GET", f"/v1/transfers/{transfer_id}", 200)
+        return resp.get("status")
 
     async def fund_transfer(self, transfer_id):
         profile_id = await self.get_profile_id()

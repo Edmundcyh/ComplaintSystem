@@ -5,9 +5,9 @@ import os
 
 # Tests empty the tables, so they must never use the database from .env.
 # Environment variables take precedence over .env for python-decouple.
-os.environ["DATABASE_URL"] = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/complaints_test",
+os.environ["DATABASE_URL"] = (
+    os.environ.get("TEST_DATABASE_URL")
+    or "postgresql://postgres:postgres@localhost:5432/complaints_test"
 )
 os.environ["SECRET_KEY"] = "test-secret-key-that-is-long-enough-for-hs256"
 
@@ -17,12 +17,19 @@ from alembic import command
 from alembic.config import Config
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
 
 from db import DATABASE_URL
 from main import app
 from services.s3 import get_s3_service
 from services.ses import get_ses_service
 from services.wise import get_wise_service
+
+if "test" not in (make_url(DATABASE_URL).database or ""):
+    raise RuntimeError(
+        f"Refusing to run the tests (they empty the tables) against {DATABASE_URL!r}; "
+        "set TEST_DATABASE_URL to a database whose name contains 'test'"
+    )
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -94,7 +101,9 @@ class FakeWise:
         self.recipients = []
         self.funded = []
         self.cancelled = []
+        self.statuses = {}  # transfer id -> status at Wise
         self.fail = set()  # names of methods that should fail
+        self.fund_response_lost = False  # funds, then fails like a timeout
         self.transfer_id_override = None
         self.fund_delay = 0
 
@@ -114,19 +123,29 @@ class FakeWise:
 
     async def create_transfer(self, target_account_id, quote_id):
         self._maybe_fail("create_transfer")
-        if self.transfer_id_override is not None:
-            return self.transfer_id_override
-        return next(self._ids)
+        transfer_id = self.transfer_id_override
+        if transfer_id is None:
+            transfer_id = next(self._ids)
+        self.statuses[transfer_id] = "incoming_payment_waiting"
+        return transfer_id
+
+    async def get_transfer_status(self, transfer_id):
+        self._maybe_fail("get_transfer_status")
+        return self.statuses[transfer_id]
 
     async def fund_transfer(self, transfer_id):
         if self.fund_delay:
             await asyncio.sleep(self.fund_delay)
         self._maybe_fail("fund_transfer")
         self.funded.append(transfer_id)
+        self.statuses[transfer_id] = "processing"
+        if self.fund_response_lost:
+            raise HTTPException(502, "Payment provider is not available at the moment")
 
     async def cancel_transfer(self, transfer_id):
         self._maybe_fail("cancel_transfer")
         self.cancelled.append(transfer_id)
+        self.statuses[transfer_id] = "cancelled"
 
 
 class FakeSES:

@@ -5,6 +5,7 @@ from starlette.requests import Request
 
 from managers.auth import oauth2_scheme, is_complainer, is_admin, is_approver
 from managers.complaint import ComplaintManager
+from resources.params import Id
 from schemas.request.complaint import ComplaintIn
 from schemas.response.complaint import ComplaintOut
 from services.s3 import S3Service, get_s3_service
@@ -47,7 +48,7 @@ async def create_complaint(
     status_code=204,
 )
 async def delete_complaint(
-    complaint_id: int, wise: WiseService = Depends(get_wise_service)
+    complaint_id: Id, wise: WiseService = Depends(get_wise_service)
 ):
     await ComplaintManager.delete(complaint_id, wise)
 
@@ -58,7 +59,7 @@ async def delete_complaint(
     status_code=204,
 )
 async def approve_complaint(
-    complaint_id: int,
+    complaint_id: Id,
     wise: WiseService = Depends(get_wise_service),
     ses: SESService = Depends(get_ses_service),
 ):
@@ -71,6 +72,6 @@ async def approve_complaint(
     status_code=204,
 )
 async def reject_complaint(
-    complaint_id: int, wise: WiseService = Depends(get_wise_service)
+    complaint_id: Id, wise: WiseService = Depends(get_wise_service)
 ):
     await ComplaintManager.reject(complaint_id, wise)
