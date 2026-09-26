@@ -36,16 +36,23 @@ class CustomHTTPBearer(HTTPBearer):
 
         try:
             payload = jwt.decode(
-                res.credentials, config("SECRET_KEY"), algorithms=["HS256"]
+                res.credentials,
+                config("SECRET_KEY"),
+                algorithms=["HS256"],
+                options={"require": ["exp", "sub"]},
             )
-            user_data = await database.fetch_one(
-                user.select().where(user.c.id == int(payload["sub"]))
-            )
-            request.state.user = user_data  # same like the User Mixin
+            user_id = int(payload["sub"])
         except jwt.ExpiredSignatureError:
             raise HTTPException(401, "Token is expired")
-        except jwt.InvalidTokenError:
+        except (jwt.InvalidTokenError, ValueError):
             raise HTTPException(401, "Invalid Token")
+
+        user_data = await database.fetch_one(user.select().where(user.c.id == user_id))
+        if not user_data:
+            # e.g. the user was deleted after the token was issued
+            raise HTTPException(401, "Invalid Token")
+        request.state.user = user_data  # same like the User Mixin
+        return res
 
 
 oauth2_scheme = CustomHTTPBearer()

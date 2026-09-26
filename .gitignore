@@ -8,9 +8,6 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# Local uploads
-temp_files/
-
 # Editors
 .idea/
 .vscode/
