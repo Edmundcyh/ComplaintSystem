@@ -7,9 +7,11 @@ from sqlalchemy.engine import make_url
 from utils.helpers import decode_photo
 from utils.validators import check_email, normalize_iban
 
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
-WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 8
+from tests.conftest import make_image
+
+JPEG = make_image("JPEG")
+PNG = make_image("PNG")
+WEBP = make_image("WEBP")
 
 
 def encode(data):
@@ -44,11 +46,22 @@ def test_decode_photo_ignores_line_breaks():
         (encode(b"plain text"), "png"),
         (encode(PNG), "jpg"),
         (encode(JPEG), "png"),
+        # Right signature, but the image data is cut off / missing
+        (encode(PNG[:-20]), "png"),
+        (encode(JPEG[: len(JPEG) // 2]), "jpg"),
+        (encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32), "png"),
     ],
 )
 def test_decode_photo_rejects(encoded, extension):
     with pytest.raises(HTTPException) as ex:
         decode_photo(encoded, extension)
+    assert ex.value.status_code == 400
+
+
+def test_decode_photo_pixel_limit(monkeypatch):
+    monkeypatch.setattr("utils.helpers.MAX_PHOTO_PIXELS", 11)
+    with pytest.raises(HTTPException) as ex:
+        decode_photo(encode(PNG), "png")  # 4 x 3 = 12 pixels
     assert ex.value.status_code == 400
 
 

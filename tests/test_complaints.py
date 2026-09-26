@@ -350,6 +350,37 @@ def test_delete_pending_cancels_and_keeps_payment_record(
     assert kept["complaint_id"] is None
 
 
+def test_delete_removes_photo(client, engine, fakes, make_user, create_complaint):
+    user, admin = make_user(), make_user("admin")
+    complaint = create_complaint(user)
+    [key] = fakes.s3.uploaded
+
+    resp = client.delete(f"/complaints/{complaint['id']}/", headers=admin["headers"])
+
+    assert resp.status_code == 204
+    assert fakes.s3.deleted == [key]
+
+
+def test_delete_keeps_complaint_when_photo_removal_fails(
+    client, engine, fakes, make_user, create_complaint
+):
+    user, admin = make_user(), make_user("admin")
+    complaint = create_complaint(user)
+    fakes.s3.fail_delete = True
+
+    resp = client.delete(f"/complaints/{complaint['id']}/", headers=admin["headers"])
+
+    assert resp.status_code == 502
+    assert [c["id"] for c in get_row(engine, "SELECT id FROM complaints")] == [
+        complaint["id"]
+    ]
+    # A retry works once S3 is back (the transfer is already cancelled)
+    fakes.s3.fail_delete = False
+    resp = client.delete(f"/complaints/{complaint['id']}/", headers=admin["headers"])
+    assert resp.status_code == 204
+    assert get_row(engine, "SELECT id FROM complaints") == []
+
+
 def test_delete_approved_does_not_cancel(client, fakes, make_user, create_complaint):
     user, approver, admin = make_user(), make_user("approver"), make_user("admin")
     complaint = create_complaint(user)
@@ -452,6 +483,27 @@ def test_approve_replaces_expired_transfer(
     assert new["amount"] == Decimal("20.00")
     assert fakes.wise.funded == [new["transfer_id"]]
     assert fakes.wise.quotes == [Decimal("20.00"), Decimal("20.00")]
+
+
+def test_replacement_transfer_is_not_paid_twice(
+    client, engine, fakes, make_user, create_complaint
+):
+    # The expired transfer is replaced, Wise pays the replacement, but the
+    # answer is lost; the retry must find the replacement, not make another
+    user, approver = make_user(), make_user("approver")
+    complaint = create_complaint(user)
+    [old] = get_row(engine, "SELECT transfer_id FROM transactions")
+    fakes.wise.statuses[old["transfer_id"]] = "cancelled"
+    url = f"/complaints/{complaint['id']}/approve"
+    fakes.wise.fund_response_lost = True
+
+    assert client.put(url, headers=approver["headers"]).status_code == 502
+    fakes.wise.fund_response_lost = False
+    assert client.put(url, headers=approver["headers"]).status_code == 204
+
+    assert len(fakes.wise.funded) == 1
+    [tx] = get_row(engine, "SELECT transfer_id FROM transactions")
+    assert tx["transfer_id"] == fakes.wise.funded[0]
 
 
 def test_approve_with_unexpected_transfer_state(

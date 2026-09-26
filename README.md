@@ -93,6 +93,8 @@ change were public and stay that way.)
   (100,000,000 or more) or not a number; correct those and run it again.
 - Everyone has to log in again: tokens issued by the old version are no longer
   accepted.
+- New passwords are limited to 72 bytes (bcrypt ignores the rest); existing
+  longer passwords keep working.
 - Clients must send `Content-Type: application/json` (Angular's `HttpClient`
   already does).
 

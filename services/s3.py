@@ -13,6 +13,11 @@ PRESIGNED_URL_EXPIRY = 3600  # seconds
 logger = logging.getLogger(__name__)
 
 
+def photo_key(photo_url):
+    # photo_url is the stored object URL; the key is its last segment
+    return photo_url.rsplit("/", 1)[-1]
+
+
 class S3Service:
     def __init__(self):
         self.key = config("AWS_ACCESS_KEY")
@@ -52,14 +57,17 @@ class S3Service:
         return f"https://{self.bucket}.s3.{self.region}.amazonaws.com/{key}"
 
     async def delete_photo(self, key):
-        await run_in_threadpool(self.s3.delete_object, Bucket=self.bucket, Key=key)
+        # Deleting a key that doesn't exist also succeeds, so retries are safe
+        try:
+            await run_in_threadpool(self.s3.delete_object, Bucket=self.bucket, Key=key)
+        except (BotoCoreError, ClientError):
+            logger.exception("S3 delete of %s failed", key)
+            raise HTTPException(502, "S3 is not available at the moment")
 
     def presigned_url(self, photo_url):
-        # photo_url is the stored object URL; the key is its last segment
-        key = photo_url.rsplit("/", 1)[-1]
         return self.s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": self.bucket, "Key": key},
+            Params={"Bucket": self.bucket, "Key": photo_key(photo_url)},
             ExpiresIn=PRESIGNED_URL_EXPIRY,
         )
 

@@ -48,9 +48,11 @@ async def create_complaint(
     status_code=204,
 )
 async def delete_complaint(
-    complaint_id: Id, wise: WiseService = Depends(get_wise_service)
+    complaint_id: Id,
+    wise: WiseService = Depends(get_wise_service),
+    s3: S3Service = Depends(get_s3_service),
 ):
-    await ComplaintManager.delete(complaint_id, wise)
+    await ComplaintManager.delete(complaint_id, wise, s3)
 
 
 @router.put(

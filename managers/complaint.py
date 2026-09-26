@@ -2,9 +2,11 @@ import logging
 import uuid
 
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from db import database
 from models import complaint, RoleType, State, transaction, user
+from services.s3 import photo_key
 from services.wise import CANCELLED, FUNDED, UNFUNDED
 from utils.helpers import decode_photo
 
@@ -26,7 +28,9 @@ class ComplaintManager:
         complaint_data["complainer_id"] = user["id"]
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
-        photo, content_type = decode_photo(encoded_photo, extension)
+        photo, content_type = await run_in_threadpool(
+            decode_photo, encoded_photo, extension
+        )
         name = f"{uuid.uuid4()}.{extension}"
         complaint_data["photo_url"] = await s3.upload_photo(photo, name, content_type)
 
@@ -62,12 +66,15 @@ class ComplaintManager:
         )
 
     @staticmethod
-    async def delete(complaint_id, wise):
+    async def delete(complaint_id, wise, s3):
         async with database.transaction():
             complaint_do = await ComplaintManager._get_for_update(complaint_id)
             if complaint_do["status"] == State.pending:
                 # Don't leave an unfunded transfer behind at Wise
                 await ComplaintManager._cancel_transfer(complaint_id, wise)
+            # Removed before the row, so a failure keeps the complaint (and the
+            # only reference to the photo) and the delete can be retried
+            await s3.delete_photo(photo_key(complaint_do["photo_url"]))
             # The transaction row is kept as a payment record; its
             # complaint_id is set to NULL by the foreign key.
             await database.execute(
@@ -79,35 +86,44 @@ class ComplaintManager:
         # The row lock is held while calling Wise so the same complaint
         # cannot be approved or rejected twice concurrently. If funding
         # fails, the status update is rolled back and stays pending.
-        async with database.transaction():
-            complaint_do = await ComplaintManager._get_pending_for_update(id_)
-            transaction_do = await ComplaintManager._get_transaction(id_)
-            if not transaction_do:
-                raise HTTPException(409, "Complaint has no payment transaction")
-            complainer = await database.fetch_one(
-                user.select().where(user.c.id == complaint_do["complainer_id"])
-            )
-            transfer_id = transaction_do["transfer_id"]
-            # Checked first: a retry after a lost Wise response must not pay
-            # again, and an expired transfer has to be replaced
-            status = await wise.get_transfer_status(transfer_id)
-            if status == CANCELLED:
-                # Wise cancels transfers that stay unfunded for about 2 weeks
-                transfer_id = await ComplaintManager._replace_transfer(
-                    transaction_do, complaint_do, complainer, wise
+        for _ in range(2):
+            async with database.transaction():
+                complaint_do = await ComplaintManager._get_pending_for_update(id_)
+                transaction_do = await ComplaintManager._get_transaction(id_)
+                if not transaction_do:
+                    raise HTTPException(409, "Complaint has no payment transaction")
+                complainer = await database.fetch_one(
+                    user.select().where(user.c.id == complaint_do["complainer_id"])
                 )
-                status = UNFUNDED
-            if status == UNFUNDED:
-                await wise.fund_transfer(transfer_id)
-            elif status not in FUNDED:
-                raise HTTPException(
-                    409,
-                    f"The refund transfer is '{status}' at Wise and needs manual attention",
+                transfer_id = transaction_do["transfer_id"]
+                # Checked first: a retry after a lost Wise response must not
+                # pay again, and an expired transfer has to be replaced
+                status = await wise.get_transfer_status(transfer_id)
+                if status == CANCELLED:
+                    # Wise cancels transfers that stay unfunded for about 2
+                    # weeks. The replacement is committed before it is funded
+                    # (by the next loop pass), so a retry after a lost funding
+                    # response finds it instead of creating and paying another
+                    await ComplaintManager._replace_transfer(
+                        transaction_do, complaint_do, complainer, wise
+                    )
+                    continue
+                if status == UNFUNDED:
+                    await wise.fund_transfer(transfer_id)
+                elif status not in FUNDED:
+                    raise HTTPException(
+                        409,
+                        f"The refund transfer is '{status}' at Wise and needs manual attention",
+                    )
+                await database.execute(
+                    complaint.update()
+                    .where(complaint.c.id == id_)
+                    .values(status=State.approved)
                 )
-            await database.execute(
-                complaint.update()
-                .where(complaint.c.id == id_)
-                .values(status=State.approved)
+                break
+        else:
+            raise HTTPException(
+                409, "The refund transfer was cancelled at Wise; try again"
             )
         # Sent after commit: the payment has gone out, so an email failure
         # must not undo the approval.
@@ -145,8 +161,6 @@ class ComplaintManager:
 
     @staticmethod
     async def _replace_transfer(transaction_do, complaint_do, complainer, wise):
-        # If funding the new transfer fails, this update is rolled back and
-        # the new, unfunded transfer simply expires at Wise
         new = await ComplaintManager.issue_transaction(
             wise,
             complaint_do["amount"],

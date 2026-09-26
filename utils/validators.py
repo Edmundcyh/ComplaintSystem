@@ -12,6 +12,14 @@ def check_email(value):
     return value
 
 
+def check_password_bytes(value):
+    # bcrypt ignores everything after 72 bytes, so a longer password would
+    # match any other password that starts with the same 72 bytes
+    if len(value.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 bytes long")
+    return value
+
+
 def normalize_iban(value):
     """Validate an IBAN's format and check digits; return it without spaces."""
     iban = value.replace(" ", "").upper()

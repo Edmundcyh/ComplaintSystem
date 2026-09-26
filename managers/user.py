@@ -9,8 +9,9 @@ from models import user, RoleType
 
 
 def _password_bytes(password):
-    # bcrypt only uses the first 72 bytes; passlib (used previously) truncated
-    # silently, so do the same to keep existing password hashes valid.
+    # bcrypt only uses the first 72 bytes. New passwords can't be longer
+    # (see check_password_bytes), but passlib, used previously, truncated
+    # silently, so accounts created before that still need the truncation.
     return password.encode("utf-8")[:72]
 
 

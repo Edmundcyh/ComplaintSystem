@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import jwt
 import sqlalchemy as sa
 
@@ -69,12 +70,29 @@ def test_wrong_credentials(client):
         assert resp.json()["detail"] == "Wrong email or password"
 
 
-def test_long_password(client):
-    # bcrypt uses the first 72 bytes; longer passwords must still work
+def test_passwords_longer_than_bcrypt_limit_are_rejected(client):
+    # bcrypt only uses the first 72 bytes, so longer passwords would share
+    # a hash with any other password that starts the same way
+    assert register(client, password="ä" * 36).status_code == 201  # 72 bytes
+    resp = register(client, email="other@example.com", password="ä" * 37)
+    assert resp.status_code == 422
+
+
+def test_existing_long_password_still_logs_in(client, engine):
+    # Accounts created before the limit were hashed from the first 72 bytes
+    # (passlib truncated silently) and must keep working
     password = "ä" * 50  # 100 bytes in UTF-8
-    assert register(client, password=password).status_code == 201
+    legacy_hash = bcrypt.hashpw(password.encode()[:72], bcrypt.gensalt()).decode()
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO users (email, password, role) "
+                "VALUES ('legacy@example.com', :hash, 'complainer')"
+            ),
+            {"hash": legacy_hash},
+        )
     resp = client.post(
-        "/login/", json={"email": "new@example.com", "password": password}
+        "/login/", json={"email": "legacy@example.com", "password": password}
     )
     assert resp.status_code == 200
 

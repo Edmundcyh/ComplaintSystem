@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import itertools
 import os
 
@@ -17,6 +18,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy.engine import make_url
 
 from db import DATABASE_URL
@@ -33,7 +35,14 @@ if "test" not in (make_url(DATABASE_URL).database or ""):
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+def make_image(image_format, size=(4, 3)):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, "red").save(buffer, image_format)
+    return buffer.getvalue()
+
+
+PNG = make_image("PNG")
 VALID_IBAN = "DE89370400440532013000"
 
 
@@ -82,12 +91,15 @@ class FakeS3:
     def __init__(self):
         self.uploaded = {}
         self.deleted = []
+        self.fail_delete = False
 
     async def upload_photo(self, data, key, content_type):
         self.uploaded[key] = (data, content_type)
         return f"https://bucket.s3.eu-west-1.amazonaws.com/{key}"
 
     async def delete_photo(self, key):
+        if self.fail_delete:
+            raise HTTPException(502, "S3 is not available at the moment")
         self.deleted.append(key)
 
     def presigned_url(self, photo_url):
