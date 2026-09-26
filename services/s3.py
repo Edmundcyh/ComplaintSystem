@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 
 import boto3
 from botocore.config import Config
@@ -24,6 +25,9 @@ class S3Service:
             aws_secret_access_key=self.secret,
             config=Config(
                 signature_version="s3v4",
+                # Regional host in presigned URLs (the global one can redirect,
+                # which breaks the signature)
+                s3={"addressing_style": "virtual"},
                 connect_timeout=5,
                 read_timeout=10,
                 retries={"max_attempts": 3, "mode": "standard"},
@@ -58,3 +62,8 @@ class S3Service:
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=PRESIGNED_URL_EXPIRY,
         )
+
+
+@lru_cache
+def get_s3_service():
+    return S3Service()

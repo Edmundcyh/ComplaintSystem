@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -5,6 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from db import database
 from resources.routes import api_router
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 
 origins = ["http://localhost", "http://localhost:4200"]
 

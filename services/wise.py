@@ -1,5 +1,6 @@
 import logging
 import uuid
+from functools import lru_cache
 
 import httpx
 from decouple import config
@@ -11,7 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class WiseService:
-    def __init__(self):
+    def __init__(self, transport=None):
+        # transport lets tests replace the network with httpx.MockTransport
+        self.transport = transport
         self.main_url = config("WISE_URL")
         self.headers = {
             "Content-Type": "application/json",
@@ -22,7 +25,10 @@ class WiseService:
     async def _request(self, method, path, expected_status, json=None):
         try:
             async with httpx.AsyncClient(
-                base_url=self.main_url, headers=self.headers, timeout=REQUEST_TIMEOUT
+                base_url=self.main_url,
+                headers=self.headers,
+                timeout=REQUEST_TIMEOUT,
+                transport=self.transport,
             ) as client:
                 resp = await client.request(method, path, json=json)
         except httpx.HTTPError:
@@ -106,3 +112,8 @@ class WiseService:
     async def cancel_transfer(self, transfer_id):
         resp = await self._request("PUT", f"/v1/transfers/{transfer_id}/cancel", 200)
         return resp["id"]
+
+
+@lru_cache
+def get_wise_service():
+    return WiseService()

@@ -1,0 +1,6 @@
+[tool.black]
+# Generated migration scripts are left as Alembic wrote them
+extend-exclude = "^/migrations/versions/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

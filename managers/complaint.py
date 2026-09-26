@@ -5,30 +5,23 @@ from fastapi import HTTPException
 
 from db import database
 from models import complaint, RoleType, State, transaction, user
-from services.s3 import S3Service
-from services.ses import SESService
-from services.wise import WiseService
 from utils.helpers import decode_photo
-
-s3 = S3Service()
-ses = SESService()
-wise = WiseService()
 
 logger = logging.getLogger(__name__)
 
 
 class ComplaintManager:
     @staticmethod
-    async def get_complaints(user):
+    async def get_complaints(user, s3):
         q = complaint.select()
         if user["role"] == RoleType.complainer:
             q = q.where(complaint.c.complainer_id == user["id"])
         elif user["role"] == RoleType.approver:
             q = q.where(complaint.c.status == State.pending)
-        return [ComplaintManager._present(c) for c in await database.fetch_all(q)]
+        return [ComplaintManager._present(c, s3) for c in await database.fetch_all(q)]
 
     @staticmethod
-    async def create_complaint(complaint_data, user):
+    async def create_complaint(complaint_data, user, s3, wise):
         complaint_data["complainer_id"] = user["id"]
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
@@ -40,6 +33,7 @@ class ComplaintManager:
         # fails, the earlier ones are undone so nothing is left orphaned.
         try:
             transaction_data = await ComplaintManager.issue_transaction(
+                wise,
                 complaint_data["amount"],
                 f"{user['first_name']} {user['last_name']}",
                 user["iban"],
@@ -62,11 +56,12 @@ class ComplaintManager:
             await ComplaintManager._undo(s3.delete_photo, name)
             raise
         return ComplaintManager._present(
-            await database.fetch_one(complaint.select().where(complaint.c.id == id_))
+            await database.fetch_one(complaint.select().where(complaint.c.id == id_)),
+            s3,
         )
 
     @staticmethod
-    async def delete(complaint_id):
+    async def delete(complaint_id, wise):
         async with database.transaction():
             complaint_do = await ComplaintManager._get_for_update(complaint_id)
             if complaint_do["status"] == State.pending:
@@ -81,7 +76,7 @@ class ComplaintManager:
             )
 
     @staticmethod
-    async def approve(id_):
+    async def approve(id_, wise, ses):
         # The row lock is held while calling Wise so the same complaint
         # cannot be approved or rejected twice concurrently. If funding
         # fails, the status update is rolled back and stays pending.
@@ -111,7 +106,7 @@ class ComplaintManager:
             logger.exception("Failed to send approval email for complaint %s", id_)
 
     @staticmethod
-    async def reject(id_):
+    async def reject(id_, wise):
         async with database.transaction():
             await ComplaintManager._get_pending_for_update(id_)
             transaction_do = await ComplaintManager._get_transaction(id_)
@@ -124,7 +119,7 @@ class ComplaintManager:
             )
 
     @staticmethod
-    async def issue_transaction(amount, full_name, iban):
+    async def issue_transaction(wise, amount, full_name, iban):
         quote_id = await wise.create_quote(amount)
         recipient_id = await wise.create_recipient_account(full_name, iban)
         transfer_id = await wise.create_transfer(recipient_id, quote_id)
@@ -136,7 +131,7 @@ class ComplaintManager:
         }
 
     @staticmethod
-    def _present(complaint_do):
+    def _present(complaint_do, s3):
         # Photos are private in S3; hand out a short-lived link instead
         data = {key: complaint_do[key] for key in complaint_do.keys()}
         data["photo_url"] = s3.presigned_url(data["photo_url"])

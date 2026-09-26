@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import boto3
 from botocore.config import Config
 from decouple import config
@@ -32,3 +34,8 @@ class SESService:
                 "Body": body,
             },
         )
+
+
+@lru_cache
+def get_ses_service():
+    return SESService()

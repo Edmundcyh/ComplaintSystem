@@ -14,18 +14,14 @@ from models import user, RoleType
 class AuthManager:
     @staticmethod
     def encode_token(user):
-        try:
-            payload = {
-                # PyJWT >= 2.10 requires "sub" to be a string
-                "sub": str(user["id"]),
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=120),
-            }
-            return jwt.encode(payload, config("SECRET_KEY"), algorithm="HS256")
-            # ES256 https://curity.io/resources/learn/jwt-best-practices/#:~:text=When%20signing%20is%20considered%2C%20currently,v1_5%20using%20SHA%2D256)
-            # pip install pyjwt[crypto]
-        except Exception as ex:
-            # Log the exception
-            raise ex
+        payload = {
+            # PyJWT >= 2.10 requires "sub" to be a string
+            "sub": str(user["id"]),
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=120),
+        }
+        return jwt.encode(payload, config("SECRET_KEY"), algorithm="HS256")
+        # ES256 https://curity.io/resources/learn/jwt-best-practices/#:~:text=When%20signing%20is%20considered%2C%20currently,v1_5%20using%20SHA%2D256)
+        # pip install pyjwt[crypto]
 
 
 class CustomHTTPBearer(HTTPBearer):

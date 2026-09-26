@@ -66,3 +66,6 @@ def downgrade() -> None:
     op.drop_table("complaints")
     op.drop_table("users")
     # ### end Alembic commands ###
+    # drop_table leaves the enum types behind; drop them so upgrading again works
+    sa.Enum(name="state").drop(op.get_bind(), checkfirst=True)
+    sa.Enum(name="roletype").drop(op.get_bind(), checkfirst=True)
