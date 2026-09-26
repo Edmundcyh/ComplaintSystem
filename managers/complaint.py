@@ -1,9 +1,12 @@
+import logging
 import os
 import uuid
 
+from fastapi import HTTPException
+
 from constants import TEMP_FILE_FOLDER
 from db import database
-from models import complaint, RoleType, State, transaction
+from models import complaint, RoleType, State, transaction, user
 from services.s3 import S3Service
 from services.ses import SESService
 from services.wise import WiseService
@@ -12,6 +15,8 @@ from utils.helpers import decode_photo
 s3 = S3Service()
 ses = SESService()
 wise = WiseService()
+
+logger = logging.getLogger(__name__)
 
 
 class ComplaintManager:
@@ -50,35 +55,84 @@ class ComplaintManager:
 
     @staticmethod
     async def delete(complaint_id):
-        await database.execute(complaint.delete().where(complaint.c.id == complaint_id))
+        async with database.transaction():
+            complaint_do = await ComplaintManager._get_for_update(complaint_id)
+            if complaint_do["status"] == State.pending:
+                # Don't leave an unfunded transfer behind at Wise
+                transaction_do = await ComplaintManager._get_transaction(complaint_id)
+                if transaction_do:
+                    wise.cancel_transfer(transaction_do["transfer_id"])
+            # The transaction row is kept as a payment record; its
+            # complaint_id is set to NULL by the foreign key.
+            await database.execute(
+                complaint.delete().where(complaint.c.id == complaint_id)
+            )
 
     @staticmethod
     async def approve(id_):
-        await database.execute(
-            complaint.update()
-            .where(complaint.c.id == id_)
-            .values(status=State.approved)
+        # The row lock is held while calling Wise so the same complaint
+        # cannot be approved or rejected twice concurrently. If funding
+        # fails, the status update is rolled back and stays pending.
+        async with database.transaction():
+            complaint_do = await ComplaintManager._get_pending_for_update(id_)
+            transaction_do = await ComplaintManager._get_transaction(id_)
+            if not transaction_do:
+                raise HTTPException(409, "Complaint has no payment transaction")
+            wise.fund_transfer(transaction_do["transfer_id"])
+            await database.execute(
+                complaint.update()
+                .where(complaint.c.id == id_)
+                .values(status=State.approved)
+            )
+        # Sent after commit: the payment has gone out, so an email failure
+        # must not undo the approval.
+        complainer = await database.fetch_one(
+            user.select().where(user.c.id == complaint_do["complainer_id"])
         )
-        transaction_data = await database.fetch_one(
-            transaction.select().where(transaction.c.complaint_id == id_)
-        )
-        wise.fund_transfer(transaction_data["transfer_id"])
-        ses.send_mail(
-            "Your complaint is approved",
-            ["me.exist87@gmail.com"],
-            "Congrats! You complaint is approved. Please check your bank account after 2 business days to verify the claimed amount is there.\n King regards!",
-        )
+        try:
+            ses.send_mail(
+                "Your complaint is approved",
+                [complainer["email"]],
+                "Congrats! Your complaint is approved. Please check your bank account after 2 business days to verify the claimed amount is there.\nKind regards!",
+            )
+        except Exception:
+            logger.exception("Failed to send approval email for complaint %s", id_)
 
     @staticmethod
     async def reject(id_):
-        transaction_data = await database.fetch_one(
-            transaction.select().where(transaction.c.complaint_id == id_)
+        async with database.transaction():
+            await ComplaintManager._get_pending_for_update(id_)
+            transaction_do = await ComplaintManager._get_transaction(id_)
+            if transaction_do:
+                wise.cancel_transfer(transaction_do["transfer_id"])
+            await database.execute(
+                complaint.update()
+                .where(complaint.c.id == id_)
+                .values(status=State.rejected)
+            )
+
+    @staticmethod
+    async def _get_for_update(id_):
+        complaint_do = await database.fetch_one(
+            complaint.select().where(complaint.c.id == id_).with_for_update()
         )
-        wise.cancel_transfer(transaction_data["transfer_id"])
-        await database.execute(
-            complaint.update()
-            .where(complaint.c.id == id_)
-            .values(status=State.rejected)
+        if not complaint_do:
+            raise HTTPException(404, "Complaint not found")
+        return complaint_do
+
+    @staticmethod
+    async def _get_pending_for_update(id_):
+        complaint_do = await ComplaintManager._get_for_update(id_)
+        if complaint_do["status"] != State.pending:
+            raise HTTPException(
+                409, f"Complaint is already {complaint_do['status'].value.lower()}"
+            )
+        return complaint_do
+
+    @staticmethod
+    async def _get_transaction(complaint_id):
+        return await database.fetch_one(
+            transaction.select().where(transaction.c.complaint_id == complaint_id)
         )
 
     @staticmethod

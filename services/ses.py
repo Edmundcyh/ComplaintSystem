@@ -12,12 +12,13 @@ class SESService:
             aws_access_key_id=self.key,
             aws_secret_access_key=self.secret,
         )
+        self.sender = config("SES_SENDER_EMAIL")
 
     def send_mail(self, subject, to_addresses, text_data):
         body = {"Text": {"Data": text_data, "Charset": "UTF-8"}}
         try:
             self.ses.send_email(
-                Source="edmundcyh@gmail.com",
+                Source=self.sender,
                 Destination={
                     "ToAddresses": to_addresses,
                     "CcAddresses": [],

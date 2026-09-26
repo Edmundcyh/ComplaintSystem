@@ -10,5 +10,8 @@ transaction = sqlalchemy.Table(
     sqlalchemy.Column("transfer_id", sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column("target_account_id", sqlalchemy.String(100), nullable=False),
     sqlalchemy.Column("amount", sqlalchemy.Float),
-    sqlalchemy.Column("complaint_id", sqlalchemy.ForeignKey("complaints.id")),
+    # Payment records outlive a deleted complaint
+    sqlalchemy.Column(
+        "complaint_id", sqlalchemy.ForeignKey("complaints.id", ondelete="SET NULL")
+    ),
 )
