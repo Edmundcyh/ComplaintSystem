@@ -5,6 +5,8 @@ import requests
 from decouple import config
 from fastapi import HTTPException
 
+REQUEST_TIMEOUT = 10  # seconds
+
 
 class WiseService:
     def __init__(self):
@@ -13,11 +15,18 @@ class WiseService:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {config('WISE_API_KEY')}",
         }
-        self.profile_id = self._get_profile_id()
+        self._profile_id = None
+
+    @property
+    def profile_id(self):
+        # Looked up on first use so the app can start without reaching Wise
+        if self._profile_id is None:
+            self._profile_id = self._get_profile_id()
+        return self._profile_id
 
     def _get_profile_id(self):
         url = self.main_url + "/v1/profiles"
-        resp = requests.get(url, headers=self.headers)
+        resp = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
 
         if resp.status_code == 200:
             resp = resp.json()
@@ -33,7 +42,9 @@ class WiseService:
             "targetAmount": amount,
             "profile": self.profile_id,
         }
-        resp = requests.post(url, headers=self.headers, data=json.dumps(data))
+        resp = requests.post(
+            url, headers=self.headers, data=json.dumps(data), timeout=REQUEST_TIMEOUT
+        )
 
         if resp.status_code == 200:
             resp = resp.json()
@@ -55,7 +66,9 @@ class WiseService:
             "legalType": "PRIVATE",
             "details": {"iban": iban},
         }
-        resp = requests.post(url, headers=self.headers, data=json.dumps(data))
+        resp = requests.post(
+            url, headers=self.headers, data=json.dumps(data), timeout=REQUEST_TIMEOUT
+        )
 
         if resp.status_code == 200:
             resp = resp.json()
@@ -77,7 +90,9 @@ class WiseService:
             "customerTransactionId": customer_transaction_id,
             "details": {},
         }
-        resp = requests.post(url, headers=self.headers, data=json.dumps(data))
+        resp = requests.post(
+            url, headers=self.headers, data=json.dumps(data), timeout=REQUEST_TIMEOUT
+        )
 
         if resp.status_code == 200:
             resp = resp.json()
@@ -96,7 +111,9 @@ class WiseService:
         )
         data = {"type": "BALANCE"}
 
-        resp = requests.post(url, data=json.dumps(data), headers=self.headers)
+        resp = requests.post(
+            url, data=json.dumps(data), headers=self.headers, timeout=REQUEST_TIMEOUT
+        )
         if resp.status_code == 201:
             resp = resp.json()
             return resp
@@ -110,7 +127,7 @@ class WiseService:
     def cancel_transfer(self, transfer_id):
         url = self.main_url + f"/v1/transfers/{transfer_id}/cancel"
 
-        resp = requests.put(url, headers=self.headers)
+        resp = requests.put(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             resp = resp.json()
             return resp["id"]

@@ -30,6 +30,7 @@ class ComplaintManager:
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
         name = f"{uuid.uuid4()}.{extension}"
+        os.makedirs(TEMP_FILE_FOLDER, exist_ok=True)
         path = os.path.join(TEMP_FILE_FOLDER, name)
         decode_photo(path, encoded_photo)
         complaint_data["photo_url"] = s3.upload_photo(path, name, extension)
@@ -40,7 +41,7 @@ class ComplaintManager:
             )
             await ComplaintManager.issue_transaction(
                 tconn,
-                data["amount"],
+                complaint_data["amount"],
                 f"{user['first_name']} {user['last_name']}",
                 user["iban"],
                 id_,

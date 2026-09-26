@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
@@ -16,8 +16,9 @@ class AuthManager:
     def encode_token(user):
         try:
             payload = {
-                "sub": user["id"],
-                "exp": datetime.utcnow() + timedelta(minutes=120),
+                # PyJWT >= 2.10 requires "sub" to be a string
+                "sub": str(user["id"]),
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=120),
             }
             return jwt.encode(payload, config("SECRET_KEY"), algorithm="HS256")
             # ES256 https://curity.io/resources/learn/jwt-best-practices/#:~:text=When%20signing%20is%20considered%2C%20currently,v1_5%20using%20SHA%2D256)
@@ -38,7 +39,7 @@ class CustomHTTPBearer(HTTPBearer):
                 res.credentials, config("SECRET_KEY"), algorithms=["HS256"]
             )
             user_data = await database.fetch_one(
-                user.select().where(user.c.id == payload["sub"])
+                user.select().where(user.c.id == int(payload["sub"]))
             )
             request.state.user = user_data  # same like the User Mixin
         except jwt.ExpiredSignatureError:

@@ -30,7 +30,7 @@ async def create_complaint(
     request: Request, complaint: ComplaintIn
 ):  # Complaint In schema
     user = request.state.user
-    return await ComplaintManager.create_complaint(complaint.dict(), user)
+    return await ComplaintManager.create_complaint(complaint.model_dump(), user)
 
 
 @router.delete(
