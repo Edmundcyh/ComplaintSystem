@@ -7,7 +7,8 @@ from PIL import Image
 
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
 # Checked before decoding: a small file can expand to a huge image in memory
-MAX_PHOTO_PIXELS = 40_000_000
+# (25 megapixels is up to ~100 MB decoded)
+MAX_PHOTO_PIXELS = 25_000_000
 ALLOWED_PHOTO_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 _PILLOW_FORMATS = {"jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}
 # Line breaks are common in base64 output; strict decoding rejects them
@@ -39,6 +40,10 @@ def decode_photo(encoded_string, extension):
         with Image.open(io.BytesIO(data), formats=formats) as image:
             # Decodes all pixel data, so truncated or corrupt images fail here
             image.load()
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+    except HTTPException:
+        raise
+    except Exception:
+        # Pillow raises many exception types for malformed files (OSError,
+        # SyntaxError, IndexError, ...); none of them should be a 500
         raise HTTPException(400, f"Photo is not a valid {extension} image")
     return data, f"image/{image_type}"

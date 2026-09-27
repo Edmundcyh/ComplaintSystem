@@ -141,3 +141,19 @@ def test_validation_errors_do_not_echo_passwords(client):
     resp = register(client, password="Pw9#xyz")
     assert resp.status_code == 422
     assert "Pw9#xyz" not in resp.text
+
+
+def test_password_with_nul_is_rejected(client):
+    # bcrypt stops at a NUL byte, so "x" * 71 + NUL would equal "x" * 71
+    assert register(client, password="x" * 71 + "\x00").status_code == 422
+
+
+def test_login_with_invalid_unicode_is_a_normal_failure(client):
+    register(client)
+    # Raw JSON: the \ud800 escape decodes to a lone surrogate
+    resp = client.post(
+        "/login/",
+        content=b'{"email": "new@example.com", "password": "abcdefgh\\ud800"}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400

@@ -1,8 +1,8 @@
 import logging
 import uuid
 
+import anyio
 from fastapi import HTTPException
-from starlette.concurrency import run_in_threadpool
 
 from db import database
 from models import complaint, RoleType, State, transaction, user
@@ -11,6 +11,9 @@ from services.wise import CANCELLED, FUNDED, UNFUNDED
 from utils.helpers import decode_photo
 
 logger = logging.getLogger(__name__)
+
+# A full photo decode can need ~100 MB of memory, so only a few run at once
+_photo_decodes = anyio.CapacityLimiter(2)
 
 
 class ComplaintManager:
@@ -28,8 +31,8 @@ class ComplaintManager:
         complaint_data["complainer_id"] = user["id"]
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
-        photo, content_type = await run_in_threadpool(
-            decode_photo, encoded_photo, extension
+        photo, content_type = await anyio.to_thread.run_sync(
+            decode_photo, encoded_photo, extension, limiter=_photo_decodes
         )
         name = f"{uuid.uuid4()}.{extension}"
         complaint_data["photo_url"] = await s3.upload_photo(photo, name, content_type)
@@ -69,12 +72,18 @@ class ComplaintManager:
     async def delete(complaint_id, wise, s3):
         async with database.transaction():
             complaint_do = await ComplaintManager._get_for_update(complaint_id)
+            transfer_id = None
             if complaint_do["status"] == State.pending:
                 # Don't leave an unfunded transfer behind at Wise
-                await ComplaintManager._cancel_transfer(complaint_id, wise)
+                transfer_id = await ComplaintManager._transfer_to_cancel(
+                    complaint_id, wise
+                )
             # Removed before the row, so a failure keeps the complaint (and the
-            # only reference to the photo) and the delete can be retried
+            # only reference to the photo) and the delete can be retried. Done
+            # before the cancel, which can't be undone if this fails
             await s3.delete_photo(photo_key(complaint_do["photo_url"]))
+            if transfer_id:
+                await wise.cancel_transfer(transfer_id)
             # The transaction row is kept as a payment record; its
             # complaint_id is set to NULL by the foreign key.
             await database.execute(
@@ -140,7 +149,9 @@ class ComplaintManager:
     async def reject(id_, wise):
         async with database.transaction():
             await ComplaintManager._get_pending_for_update(id_)
-            await ComplaintManager._cancel_transfer(id_, wise)
+            transfer_id = await ComplaintManager._transfer_to_cancel(id_, wise)
+            if transfer_id:
+                await wise.cancel_transfer(transfer_id)
             await database.execute(
                 complaint.update()
                 .where(complaint.c.id == id_)
@@ -179,26 +190,28 @@ class ComplaintManager:
         return new["transfer_id"]
 
     @staticmethod
-    async def _cancel_transfer(complaint_id, wise):
+    async def _transfer_to_cancel(complaint_id, wise):
+        """Return the Wise transfer that still has to be cancelled, if any."""
         transaction_do = await ComplaintManager._get_transaction(complaint_id)
         if not transaction_do:
-            return
+            return None
         transfer_id = transaction_do["transfer_id"]
         # Checked first so a retry after a lost response, or a transfer Wise
         # already cancelled, doesn't fail
         status = await wise.get_transfer_status(transfer_id)
         if status == UNFUNDED:
-            await wise.cancel_transfer(transfer_id)
-        elif status in FUNDED:
+            return transfer_id
+        if status in FUNDED:
             # e.g. an approval whose response was lost
             raise HTTPException(
                 409, "The refund has already been paid; approve the complaint instead"
             )
-        elif status != CANCELLED:
+        if status != CANCELLED:
             raise HTTPException(
                 409,
                 f"The refund transfer is '{status}' at Wise and needs manual attention",
             )
+        return None
 
     @staticmethod
     def _present(complaint_do, s3):

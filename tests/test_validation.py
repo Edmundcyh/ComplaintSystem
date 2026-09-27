@@ -50,6 +50,8 @@ def test_decode_photo_ignores_line_breaks():
         (encode(PNG[:-20]), "png"),
         (encode(JPEG[: len(JPEG) // 2]), "jpg"),
         (encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32), "png"),
+        # Header and end but no image data (made Pillow raise IndexError)
+        ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAAElFTkSuQmCC", "png"),
     ],
 )
 def test_decode_photo_rejects(encoded, extension):

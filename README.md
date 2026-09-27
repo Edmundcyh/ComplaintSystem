@@ -66,7 +66,7 @@ Admins can then promote other users with `PUT /users/{id}/make-approver` or
 | POST | `/complaints/` | complainer | File a complaint |
 | PUT | `/complaints/{id}/approve` | approver | Pay the refund and email the complainer |
 | PUT | `/complaints/{id}/reject` | approver | Cancel the refund |
-| DELETE | `/complaints/{id}/` | admin | Delete (cancels the refund if still pending) |
+| DELETE | `/complaints/{id}/` | admin | Delete the complaint and its photo (cancels the refund if still pending) |
 | GET | `/users/?email=` | admin | List users, optionally by email |
 | PUT | `/users/{id}/make-admin`, `/users/{id}/make-approver` | admin | Change a role |
 
@@ -75,19 +75,25 @@ Send the token as `Authorization: Bearer <token>`; tokens last 2 hours.
 Send JSON with `Content-Type: application/json`; request bodies are limited
 to 8 MB. A complaint needs `title` (up to 120 characters), `description` (up
 to 5000), `amount` (more than 0, at most 2 decimals), `encoded_photo` (base64,
-up to 5 MB) and `extension` (`jpg`, `jpeg`, `png` or `webp`, matching the
-photo). Only pending complaints can be approved or rejected; anything else
-returns `409`.
+up to 5 MB and 25 megapixels) and `extension` (`jpg`, `jpeg`, `png` or `webp`,
+matching the photo). Photos are fully decoded, so cut-off or corrupt files are
+rejected; the formats themselves can't reveal every kind of damage (e.g. WebP
+image data has no checksum). Only pending complaints can be approved or
+rejected; anything else returns `409`.
 
 `photo_url` in responses is a presigned S3 link that expires after one hour,
-so fetch complaints again rather than storing it. (Photos uploaded before this
-change were public and stay that way.)
+so fetch complaints again rather than storing it.
 
 ## Upgrading an existing installation
 
 - Add `SES_SENDER_EMAIL` to `.env` (the sender used to be hard-coded). Without
   it approvals still work, but no email is sent and an error is logged.
 - Give the AWS user the permissions listed under [Setup](#setup).
+- Turn on S3 Block Public Access for the bucket. Photos used to be uploaded as
+  public, including those of complaints deleted before this version (which
+  are no longer referenced anywhere); the app now only uses signed links, so
+  nothing needs public access. If the bucket is versioned, add a lifecycle
+  rule that expires noncurrent versions, or deleted photos are kept.
 - Run `alembic upgrade head`. It converts amounts to exact decimals (rounded
   to 2 places) and stops with a list of rows if any amount is too large
   (100,000,000 or more) or not a number; correct those and run it again.

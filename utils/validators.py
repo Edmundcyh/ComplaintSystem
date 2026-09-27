@@ -13,10 +13,17 @@ def check_email(value):
 
 
 def check_password_bytes(value):
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("Password contains invalid characters")
     # bcrypt ignores everything after 72 bytes, so a longer password would
-    # match any other password that starts with the same 72 bytes
-    if len(value.encode("utf-8")) > 72:
+    # match any other password that starts with the same 72 bytes; it also
+    # treats a NUL byte as the end of the password
+    if len(encoded) > 72:
         raise ValueError("Password must be at most 72 bytes long")
+    if b"\x00" in encoded:
+        raise ValueError("Password must not contain NUL characters")
     return value
 
 

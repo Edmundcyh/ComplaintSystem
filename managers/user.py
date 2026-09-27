@@ -20,7 +20,12 @@ def hash_password(password):
 
 
 def verify_password(password, password_hash):
-    return bcrypt.checkpw(_password_bytes(password), password_hash.encode("utf-8"))
+    try:
+        password_bytes = _password_bytes(password)
+    except UnicodeEncodeError:
+        # Not a password anyone can have registered with
+        return False
+    return bcrypt.checkpw(password_bytes, password_hash.encode("utf-8"))
 
 
 class UserManager:

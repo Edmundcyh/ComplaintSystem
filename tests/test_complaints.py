@@ -92,6 +92,40 @@ def test_text_limits_and_validation_errors(client, make_user):
     assert all("input" not in e for e in resp.json()["detail"])
 
 
+def test_photo_decodes_are_limited(client, make_user, monkeypatch):
+    import threading
+    import time
+
+    import managers.complaint
+    from utils.helpers import decode_photo
+
+    lock, active, peak = threading.Lock(), [0], [0]
+
+    def slow_decode(*args):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.2)
+        with lock:
+            active[0] -= 1
+        return decode_photo(*args)
+
+    monkeypatch.setattr(managers.complaint, "decode_photo", slow_decode)
+    user = make_user()
+    with ThreadPoolExecutor(6) as pool:
+        codes = list(
+            pool.map(
+                lambda _: client.post(
+                    "/complaints/", json=complaint_body(), headers=user["headers"]
+                ).status_code,
+                range(6),
+            )
+        )
+
+    assert codes == [200] * 6
+    assert peak[0] == 2
+
+
 def test_wise_failure_removes_uploaded_photo(client, engine, fakes, make_user):
     user = make_user()
     fakes.wise.fail.add("create_transfer")
@@ -374,6 +408,8 @@ def test_delete_keeps_complaint_when_photo_removal_fails(
     assert [c["id"] for c in get_row(engine, "SELECT id FROM complaints")] == [
         complaint["id"]
     ]
+    # Nothing irreversible happened: the refund transfer is still open
+    assert fakes.wise.cancelled == []
     # A retry works once S3 is back (the transfer is already cancelled)
     fakes.s3.fail_delete = False
     resp = client.delete(f"/complaints/{complaint['id']}/", headers=admin["headers"])
