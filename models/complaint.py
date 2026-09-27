@@ -9,7 +9,7 @@ complaint = sqlalchemy.Table(
     sqlalchemy.Column("title", sqlalchemy.String(120), nullable=False),
     sqlalchemy.Column("description", sqlalchemy.Text, nullable=False),
     sqlalchemy.Column("photo_url", sqlalchemy.String(200), nullable=False),
-    sqlalchemy.Column("amount", sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column("amount", sqlalchemy.Numeric(10, 2), nullable=False),
     sqlalchemy.Column(
         "created_at", sqlalchemy.DateTime, server_default=sqlalchemy.func.now()
     ),

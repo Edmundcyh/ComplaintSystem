@@ -1,95 +1,252 @@
-import os
+import logging
 import uuid
 
-from constants import TEMP_FILE_FOLDER
+import anyio
+from fastapi import HTTPException
+
 from db import database
-from models import complaint, RoleType, State, transaction
-from services.s3 import S3Service
-from services.ses import SESService
-from services.wise import WiseService
+from models import complaint, RoleType, State, transaction, user
+from services.s3 import photo_key
+from services.wise import CANCELLED, FUNDED, UNFUNDED
 from utils.helpers import decode_photo
 
-s3 = S3Service()
-ses = SESService()
-wise = WiseService()
+logger = logging.getLogger(__name__)
+
+# A full photo decode can need ~100 MB of memory, so only a few run at once
+_photo_decodes = anyio.CapacityLimiter(2)
 
 
 class ComplaintManager:
     @staticmethod
-    async def get_complaints(user):
+    async def get_complaints(user, s3):
         q = complaint.select()
         if user["role"] == RoleType.complainer:
             q = q.where(complaint.c.complainer_id == user["id"])
         elif user["role"] == RoleType.approver:
             q = q.where(complaint.c.status == State.pending)
-        return await database.fetch_all(q)
+        return [ComplaintManager._present(c, s3) for c in await database.fetch_all(q)]
 
     @staticmethod
-    async def create_complaint(complaint_data, user):
+    async def create_complaint(complaint_data, user, s3, wise):
         complaint_data["complainer_id"] = user["id"]
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
+        photo, content_type = await anyio.to_thread.run_sync(
+            decode_photo, encoded_photo, extension, limiter=_photo_decodes
+        )
         name = f"{uuid.uuid4()}.{extension}"
-        path = os.path.join(TEMP_FILE_FOLDER, name)
-        decode_photo(path, encoded_photo)
-        complaint_data["photo_url"] = s3.upload_photo(path, name, extension)
-        os.remove(path)
-        async with database.transaction() as tconn:
-            id_ = await tconn._connection.execute(
-                complaint.insert().values(**complaint_data)
-            )
-            await ComplaintManager.issue_transaction(
-                tconn,
-                data["amount"],
+        complaint_data["photo_url"] = await s3.upload_photo(photo, name, content_type)
+
+        # External calls happen outside the DB transaction; if a later step
+        # fails, the earlier ones are undone so nothing is left orphaned.
+        try:
+            transaction_data = await ComplaintManager.issue_transaction(
+                wise,
+                complaint_data["amount"],
                 f"{user['first_name']} {user['last_name']}",
                 user["iban"],
-                id_,
-            )  # create transaction for refund here
-        return await database.fetch_one(complaint.select().where(complaint.c.id == id_))
-
-    @staticmethod
-    async def delete(complaint_id):
-        await database.execute(complaint.delete().where(complaint.c.id == complaint_id))
-
-    @staticmethod
-    async def approve(id_):
-        await database.execute(
-            complaint.update()
-            .where(complaint.c.id == id_)
-            .values(status=State.approved)
-        )
-        transaction_data = await database.fetch_one(
-            transaction.select().where(transaction.c.complaint_id == id_)
-        )
-        wise.fund_transfer(transaction_data["transfer_id"])
-        ses.send_mail(
-            "Your complaint is approved",
-            ["me.exist87@gmail.com"],
-            "Congrats! You complaint is approved. Please check your bank account after 2 business days to verify the claimed amount is there.\n King regards!",
+            )
+        except Exception:
+            await ComplaintManager._undo(s3.delete_photo, name)
+            raise
+        try:
+            async with database.transaction():
+                id_ = await database.execute(
+                    complaint.insert().values(**complaint_data)
+                )
+                await database.execute(
+                    transaction.insert().values(**transaction_data, complaint_id=id_)
+                )
+        except Exception:
+            await ComplaintManager._undo(
+                wise.cancel_transfer, transaction_data["transfer_id"]
+            )
+            await ComplaintManager._undo(s3.delete_photo, name)
+            raise
+        return ComplaintManager._present(
+            await database.fetch_one(complaint.select().where(complaint.c.id == id_)),
+            s3,
         )
 
     @staticmethod
-    async def reject(id_):
-        transaction_data = await database.fetch_one(
-            transaction.select().where(transaction.c.complaint_id == id_)
-        )
-        wise.cancel_transfer(transaction_data["transfer_id"])
-        await database.execute(
-            complaint.update()
-            .where(complaint.c.id == id_)
-            .values(status=State.rejected)
-        )
+    async def delete(complaint_id, wise, s3):
+        async with database.transaction():
+            complaint_do = await ComplaintManager._get_for_update(complaint_id)
+            transfer_id = None
+            if complaint_do["status"] == State.pending:
+                # Don't leave an unfunded transfer behind at Wise
+                transfer_id = await ComplaintManager._transfer_to_cancel(
+                    complaint_id, wise
+                )
+            # Removed before the row, so a failure keeps the complaint (and the
+            # only reference to the photo) and the delete can be retried. Done
+            # before the cancel, which can't be undone if this fails
+            await s3.delete_photo(photo_key(complaint_do["photo_url"]))
+            if transfer_id:
+                await wise.cancel_transfer(transfer_id)
+            # The transaction row is kept as a payment record; its
+            # complaint_id is set to NULL by the foreign key.
+            await database.execute(
+                complaint.delete().where(complaint.c.id == complaint_id)
+            )
 
     @staticmethod
-    async def issue_transaction(tconn, amount, full_name, iban, complaint_id):
-        quote_id = wise.create_quote(amount)
-        recipient_id = wise.create_recipient_account(full_name, iban)
-        transfer_id = wise.create_transfer(recipient_id, quote_id)
-        data = {
+    async def approve(id_, wise, ses):
+        # The row lock is held while calling Wise so the same complaint
+        # cannot be approved or rejected twice concurrently. If funding
+        # fails, the status update is rolled back and stays pending.
+        for _ in range(2):
+            async with database.transaction():
+                complaint_do = await ComplaintManager._get_pending_for_update(id_)
+                transaction_do = await ComplaintManager._get_transaction(id_)
+                if not transaction_do:
+                    raise HTTPException(409, "Complaint has no payment transaction")
+                complainer = await database.fetch_one(
+                    user.select().where(user.c.id == complaint_do["complainer_id"])
+                )
+                transfer_id = transaction_do["transfer_id"]
+                # Checked first: a retry after a lost Wise response must not
+                # pay again, and an expired transfer has to be replaced
+                status = await wise.get_transfer_status(transfer_id)
+                if status == CANCELLED:
+                    # Wise cancels transfers that stay unfunded for about 2
+                    # weeks. The replacement is committed before it is funded
+                    # (by the next loop pass), so a retry after a lost funding
+                    # response finds it instead of creating and paying another
+                    await ComplaintManager._replace_transfer(
+                        transaction_do, complaint_do, complainer, wise
+                    )
+                    continue
+                if status == UNFUNDED:
+                    await wise.fund_transfer(transfer_id)
+                elif status not in FUNDED:
+                    raise HTTPException(
+                        409,
+                        f"The refund transfer is '{status}' at Wise and needs manual attention",
+                    )
+                await database.execute(
+                    complaint.update()
+                    .where(complaint.c.id == id_)
+                    .values(status=State.approved)
+                )
+                break
+        else:
+            raise HTTPException(
+                409, "The refund transfer was cancelled at Wise; try again"
+            )
+        # Sent after commit: the payment has gone out, so an email failure
+        # must not undo the approval.
+        try:
+            await ses.send_mail(
+                "Your complaint is approved",
+                [complainer["email"]],
+                "Congrats! Your complaint is approved. Please check your bank account after 2 business days to verify the claimed amount is there.\nKind regards!",
+            )
+        except Exception:
+            logger.exception("Failed to send approval email for complaint %s", id_)
+
+    @staticmethod
+    async def reject(id_, wise):
+        async with database.transaction():
+            await ComplaintManager._get_pending_for_update(id_)
+            transfer_id = await ComplaintManager._transfer_to_cancel(id_, wise)
+            if transfer_id:
+                await wise.cancel_transfer(transfer_id)
+            await database.execute(
+                complaint.update()
+                .where(complaint.c.id == id_)
+                .values(status=State.rejected)
+            )
+
+    @staticmethod
+    async def issue_transaction(wise, amount, full_name, iban):
+        quote_id = await wise.create_quote(amount)
+        recipient_id = await wise.create_recipient_account(full_name, iban)
+        transfer_id = await wise.create_transfer(recipient_id, quote_id)
+        return {
             "quote_id": quote_id,
             "transfer_id": transfer_id,
             "target_account_id": str(recipient_id),
             "amount": amount,
-            "complaint_id": complaint_id,
         }
-        await tconn._connection.execute(transaction.insert().values(**data))
+
+    @staticmethod
+    async def _replace_transfer(transaction_do, complaint_do, complainer, wise):
+        new = await ComplaintManager.issue_transaction(
+            wise,
+            complaint_do["amount"],
+            f"{complainer['first_name']} {complainer['last_name']}",
+            complainer["iban"],
+        )
+        await database.execute(
+            transaction.update()
+            .where(transaction.c.id == transaction_do["id"])
+            .values(
+                quote_id=new["quote_id"],
+                transfer_id=new["transfer_id"],
+                target_account_id=new["target_account_id"],
+            )
+        )
+        return new["transfer_id"]
+
+    @staticmethod
+    async def _transfer_to_cancel(complaint_id, wise):
+        """Return the Wise transfer that still has to be cancelled, if any."""
+        transaction_do = await ComplaintManager._get_transaction(complaint_id)
+        if not transaction_do:
+            return None
+        transfer_id = transaction_do["transfer_id"]
+        # Checked first so a retry after a lost response, or a transfer Wise
+        # already cancelled, doesn't fail
+        status = await wise.get_transfer_status(transfer_id)
+        if status == UNFUNDED:
+            return transfer_id
+        if status in FUNDED:
+            # e.g. an approval whose response was lost
+            raise HTTPException(
+                409, "The refund has already been paid; approve the complaint instead"
+            )
+        if status != CANCELLED:
+            raise HTTPException(
+                409,
+                f"The refund transfer is '{status}' at Wise and needs manual attention",
+            )
+        return None
+
+    @staticmethod
+    def _present(complaint_do, s3):
+        # Photos are private in S3; hand out a short-lived link instead
+        data = {key: complaint_do[key] for key in complaint_do.keys()}
+        data["photo_url"] = s3.presigned_url(data["photo_url"])
+        return data
+
+    @staticmethod
+    async def _undo(action, *args):
+        try:
+            await action(*args)
+        except Exception:
+            logger.exception("Cleanup %s%s failed", action.__name__, args)
+
+    @staticmethod
+    async def _get_for_update(id_):
+        complaint_do = await database.fetch_one(
+            complaint.select().where(complaint.c.id == id_).with_for_update()
+        )
+        if not complaint_do:
+            raise HTTPException(404, "Complaint not found")
+        return complaint_do
+
+    @staticmethod
+    async def _get_pending_for_update(id_):
+        complaint_do = await ComplaintManager._get_for_update(id_)
+        if complaint_do["status"] != State.pending:
+            raise HTTPException(
+                409, f"Complaint is already {complaint_do['status'].value.lower()}"
+            )
+        return complaint_do
+
+    @staticmethod
+    async def _get_transaction(complaint_id):
+        return await database.fetch_one(
+            transaction.select().where(transaction.c.complaint_id == complaint_id)
+        )
