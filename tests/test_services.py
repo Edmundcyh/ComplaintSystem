@@ -1,6 +1,10 @@
 import asyncio
 import json
+import time
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
+import anyio
 import httpx
 import pytest
 from fastapi import HTTPException
@@ -241,12 +245,103 @@ def test_wise_requests_that_could_repeat_an_action_are_not_retried(monkeypatch, 
     assert len(requests) == 5  # profile lookup + one attempt each
 
 
-def test_wise_status_lookup_is_retried(monkeypatch, sleeps):
-    answers = iter(
-        [httpx.Response(503), httpx.Response(200, json={"status": "processing"})]
-    )
-    service = wise(lambda request: next(answers), monkeypatch)
-    assert run(service.get_transfer_status(99)) == "processing"
+def test_wise_lookups_are_not_retried(monkeypatch, sleeps):
+    # They run while a complaint row is locked; retrying would hold the lock
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    service = wise(handler, monkeypatch)
+    with pytest.raises(HTTPException):
+        run(service.get_transfer_status(99))
+    with pytest.raises(HTTPException):
+        run(service.get_profile_id())
+    assert len(requests) == 2 and sleeps == []
+
+
+def test_wise_transfer_creation_without_retry(monkeypatch, sleeps, caplog):
+    keys = []
+
+    def handler(request):
+        keys.append(json.loads(request.content)["customerTransactionId"])
+        raise httpx.ReadTimeout("response lost")
+
+    with pytest.raises(HTTPException):
+        run(wise(handler, monkeypatch).create_transfer(42, "quote-1", retry=False))
+    assert len(keys) == 1 and keys[0] in caplog.text
+
+
+def test_wise_attempt_is_capped_as_a_whole(monkeypatch):
+    # A server that keeps the connection busy can't stretch an attempt past
+    # REQUEST_TIMEOUT (httpx's own timeout is per network step)
+    monkeypatch.setattr("services.wise.REQUEST_TIMEOUT", 0.1)
+
+    async def handler(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={"status": "processing"})
+
+    service = wise(handler, monkeypatch)
+    started = time.monotonic()
+    with pytest.raises(HTTPException) as ex:
+        run(service.get_transfer_status(99))
+    assert ex.value.status_code == 502
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(
+    "retry_after, retried",
+    [
+        (
+            lambda: format_datetime(
+                datetime.now(timezone.utc) + timedelta(hours=1), usegmt=True
+            ),
+            False,
+        ),
+        (
+            lambda: format_datetime(
+                datetime.now(timezone.utc) - timedelta(seconds=5), usegmt=True
+            ),
+            True,
+        ),
+        (lambda: "soon", False),
+    ],
+)
+def test_wise_retry_after_dates_and_garbage(monkeypatch, sleeps, retry_after, retried):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": retry_after()})
+        return httpx.Response(200, json={"id": 7})
+
+    service = wise(handler, monkeypatch)
+    if retried:
+        assert run(service.create_transfer(42, "quote-1")) == 7
+        assert sleeps == [0]
+    else:
+        with pytest.raises(HTTPException):
+            run(service.create_transfer(42, "quote-1"))
+        assert len(requests) == 1
+
+
+def test_cancelled_transfer_creation_still_logs_the_id(monkeypatch, caplog):
+    keys = []
+
+    async def handler(request):
+        keys.append(json.loads(request.content)["customerTransactionId"])
+        await asyncio.sleep(5)
+
+    service = wise(handler, monkeypatch)
+
+    async def create_then_give_up():
+        with anyio.move_on_after(0.1):
+            await service.create_transfer(42, "quote-1")
+
+    run(create_then_give_up())
+    assert keys and keys[0] in caplog.text
 
 
 def test_s3_presigned_url(monkeypatch):

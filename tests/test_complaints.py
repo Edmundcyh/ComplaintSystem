@@ -519,6 +519,9 @@ def test_approve_replaces_expired_transfer(
     assert new["amount"] == Decimal("20.00")
     assert fakes.wise.funded == [new["transfer_id"]]
     assert fakes.wise.quotes == [Decimal("20.00"), Decimal("20.00")]
+    # Filing retries transfer creation; the replacement runs under the row
+    # lock and doesn't
+    assert fakes.wise.create_transfer_retry == [True, False]
 
 
 def test_replacement_transfer_is_not_paid_twice(

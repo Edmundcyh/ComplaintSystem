@@ -159,10 +159,10 @@ class ComplaintManager:
             )
 
     @staticmethod
-    async def issue_transaction(wise, amount, full_name, iban):
+    async def issue_transaction(wise, amount, full_name, iban, retry=True):
         quote_id = await wise.create_quote(amount)
         recipient_id = await wise.create_recipient_account(full_name, iban)
-        transfer_id = await wise.create_transfer(recipient_id, quote_id)
+        transfer_id = await wise.create_transfer(recipient_id, quote_id, retry=retry)
         return {
             "quote_id": quote_id,
             "transfer_id": transfer_id,
@@ -172,11 +172,14 @@ class ComplaintManager:
 
     @staticmethod
     async def _replace_transfer(transaction_do, complaint_do, complainer, wise):
+        # Runs under the row lock, so a failed attempt isn't retried (the
+        # customerTransactionId is logged if Wise may have created it)
         new = await ComplaintManager.issue_transaction(
             wise,
             complaint_do["amount"],
             f"{complainer['first_name']} {complainer['last_name']}",
             complainer["iban"],
+            retry=False,
         )
         await database.execute(
             transaction.update()
