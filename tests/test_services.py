@@ -327,6 +327,26 @@ def test_wise_retry_after_dates_and_garbage(monkeypatch, sleeps, retry_after, re
         assert len(requests) == 1
 
 
+@pytest.mark.parametrize("retry_after", ["NaN", "-nan", "inf", "-inf", "1e400"])
+def test_wise_nonfinite_retry_after_is_not_waited_for(monkeypatch, retry_after):
+    # Sleeping for NaN never returns, so these must not be used as a delay
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": retry_after})
+        return httpx.Response(200, json={"id": 7})
+
+    service = wise(handler, monkeypatch)
+    started = time.monotonic()
+    with pytest.raises(HTTPException) as ex:
+        run(service.create_transfer(42, "quote-1"))
+    assert ex.value.status_code == 502
+    assert len(requests) == 1
+    assert time.monotonic() - started < 2
+
+
 def test_cancelled_transfer_creation_still_logs_the_id(monkeypatch, caplog):
     keys = []
 

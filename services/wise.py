@@ -1,4 +1,5 @@
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -41,7 +42,8 @@ def _error_summary(resp):
 
 
 def _retry_after(resp, default):
-    """Seconds to wait as asked by a 429 response, or None if that's too long."""
+    """Seconds to wait as asked by a 429 response, or None if that's too long
+    or not a usable number."""
     value = resp.headers.get("Retry-After")
     if value is None:
         return default
@@ -56,7 +58,11 @@ def _retry_after(resp, default):
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
         delay = (when - datetime.now(timezone.utc)).total_seconds()
-    return max(delay, 0) if delay <= MAX_RETRY_AFTER else None
+    # Checked explicitly: NaN would slip past a comparison written the other
+    # way round, and sleeping for NaN never returns
+    if not math.isfinite(delay) or delay > MAX_RETRY_AFTER:
+        return None
+    return max(delay, 0)
 
 
 class WiseService:
