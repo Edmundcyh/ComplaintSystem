@@ -1,12 +1,19 @@
 import logging
+import math
 import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 
+import anyio
 import httpx
 from decouple import config
 from fastapi import HTTPException
 
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 10  # seconds, for a whole attempt
+# Waits between attempts of requests that are safe to repeat
+RETRY_DELAYS = (0.5, 2)  # seconds
+MAX_RETRY_AFTER = 5  # seconds; longer Retry-After values are not waited for
 
 # Wise transfer statuses (GET /v1/transfers/{id})
 UNFUNDED = "incoming_payment_waiting"
@@ -34,6 +41,30 @@ def _error_summary(resp):
     return "no error code"
 
 
+def _retry_after(resp, default):
+    """Seconds to wait as asked by a 429 response, or None if that's too long
+    or not a usable number."""
+    value = resp.headers.get("Retry-After")
+    if value is None:
+        return default
+    try:
+        delay = float(value)
+    except ValueError:
+        # The other allowed form is an HTTP date
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        delay = (when - datetime.now(timezone.utc)).total_seconds()
+    # Checked explicitly: NaN would slip past a comparison written the other
+    # way round, and sleeping for NaN never returns
+    if not math.isfinite(delay) or delay > MAX_RETRY_AFTER:
+        return None
+    return max(delay, 0)
+
+
 class WiseService:
     def __init__(self, transport=None):
         # transport lets tests replace the network with httpx.MockTransport
@@ -45,18 +76,54 @@ class WiseService:
         }
         self._profile_id = None
 
-    async def _request(self, method, path, expected_status, json=None):
+    async def _send(self, method, path, json):
+        # httpx applies its timeout to each network step separately, so the
+        # attempt as a whole is capped too
         try:
-            async with httpx.AsyncClient(
-                base_url=self.main_url,
-                headers=self.headers,
-                timeout=REQUEST_TIMEOUT,
-                transport=self.transport,
-            ) as client:
-                resp = await client.request(method, path, json=json)
-        except httpx.HTTPError:
-            logger.exception("Wise request %s %s failed", method, path)
-            raise HTTPException(502, "Payment provider is not available at the moment")
+            with anyio.fail_after(REQUEST_TIMEOUT):
+                async with httpx.AsyncClient(
+                    base_url=self.main_url,
+                    headers=self.headers,
+                    timeout=REQUEST_TIMEOUT,
+                    transport=self.transport,
+                ) as client:
+                    return await client.request(method, path, json=json)
+        except TimeoutError as ex:
+            raise httpx.TimeoutException(f"No answer within {REQUEST_TIMEOUT}s") from ex
+
+    async def _request(self, method, path, expected_status, json=None, retry=False):
+        # retry: only for requests Wise handles at most once (transfer creation
+        # with the same customerTransactionId), and not while a complaint row
+        # is locked, so a Wise outage can't hold locks and DB connections long
+        delays = list(RETRY_DELAYS) if retry else []
+        while True:
+            try:
+                resp = await self._send(method, path, json)
+            except httpx.HTTPError:
+                if not delays:
+                    logger.exception("Wise request %s %s failed", method, path)
+                    raise HTTPException(
+                        502, "Payment provider is not available at the moment"
+                    )
+                logger.warning(
+                    "Wise request %s %s failed, retrying", method, path, exc_info=True
+                )
+                await anyio.sleep(delays.pop(0))
+                continue
+            if delays and (resp.status_code == 429 or resp.status_code >= 500):
+                delay = delays.pop(0)
+                if resp.status_code == 429:
+                    delay = _retry_after(resp, default=delay)
+                if delay is not None:
+                    logger.warning(
+                        "Wise request %s %s returned %s, retrying",
+                        method,
+                        path,
+                        resp.status_code,
+                    )
+                    await anyio.sleep(delay)
+                    continue
+            break
         if resp.status_code != expected_status:
             logger.error(
                 "Wise request %s %s returned %s: %s",
@@ -107,14 +174,30 @@ class WiseService:
         resp = await self._request("POST", "/v1/accounts", 200, json=data)
         return resp["id"]
 
-    async def create_transfer(self, target_account_id, quote_id):
+    async def create_transfer(self, target_account_id, quote_id, retry=True):
+        # Wise creates at most one transfer per customerTransactionId, so the
+        # request is retried with the same id: a timeout whose transfer was
+        # created anyway then returns that transfer instead of losing track
+        # of it. Pass retry=False while holding a complaint's row lock.
+        customer_transaction_id = str(uuid.uuid4())
         data = {
             "targetAccount": target_account_id,
             "quoteUuid": quote_id,
-            "customerTransactionId": str(uuid.uuid4()),
+            "customerTransactionId": customer_transaction_id,
             "details": {},
         }
-        resp = await self._request("POST", "/v1/transfers", 200, json=data)
+        try:
+            resp = await self._request(
+                "POST", "/v1/transfers", 200, json=data, retry=retry
+            )
+        except BaseException:
+            # Wise may still have created it (also if this request was
+            # cancelled midway); this id finds it in Wise
+            logger.error(
+                "Creating Wise transfer with customerTransactionId %s failed",
+                customer_transaction_id,
+            )
+            raise
         return resp["id"]
 
     async def get_transfer_status(self, transfer_id):

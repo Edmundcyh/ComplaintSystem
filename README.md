@@ -72,8 +72,9 @@ Admins can then promote other users with `PUT /users/{id}/make-approver` or
 
 Send the token as `Authorization: Bearer <token>`; tokens last 2 hours.
 
-Send JSON with `Content-Type: application/json`; request bodies are limited
-to 8 MB. A complaint needs `title` (up to 120 characters), `description` (up
+Send JSON with `Content-Type: application/json` (a request without a
+`Content-Type` header is also read as JSON; other content types get `422`).
+Request bodies are limited to 8 MB. A complaint needs `title` (up to 120 characters), `description` (up
 to 5000), `amount` (more than 0, at most 2 decimals), `encoded_photo` (base64,
 up to 5 MB and 25 megapixels) and `extension` (`jpg`, `jpeg`, `png` or `webp`,
 matching the photo). Photos are fully decoded, so cut-off or corrupt files are
@@ -101,8 +102,6 @@ so fetch complaints again rather than storing it.
   accepted.
 - New passwords are limited to 72 bytes (bcrypt ignores the rest); existing
   longer passwords keep working.
-- Clients must send `Content-Type: application/json` (Angular's `HttpClient`
-  already does).
 
 ## Tests
 
@@ -125,6 +124,14 @@ are needed. The same checks (`black --check .` and `pytest` on Python
 
 - Use `https://api.wise-sandbox.com` while testing; the old
   `api.sandbox.transferwise.tech` host has been retired.
+- When a complaint is filed, creating its transfer is retried a few times if
+  Wise times out or is briefly unavailable. Each retry reuses the same
+  `customerTransactionId`, so Wise returns the transfer it may already have
+  created instead of making a new one. If creating a transfer fails, that id
+  is logged so the transfer can be found in Wise. Calls made while a complaint
+  is being approved, rejected or deleted are not retried, so a Wise outage
+  doesn't hold database locks for long; each Wise request is capped at 10
+  seconds.
 - Before paying or cancelling, the app asks Wise for the transfer's status.
   This makes retries safe (a payment whose response was lost isn't made
   twice) and replaces transfers that Wise cancelled because they stayed

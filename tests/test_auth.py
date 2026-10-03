@@ -157,3 +157,12 @@ def test_login_with_invalid_unicode_is_a_normal_failure(client):
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 400
+
+
+def test_json_without_content_type_is_accepted(client):
+    # As before the FastAPI upgrade; other content types are still rejected
+    register(client)
+    body = b'{"email": "new@example.com", "password": "password123"}'
+    assert client.post("/login/", content=body).status_code == 200
+    resp = client.post("/login/", content=body, headers={"Content-Type": "text/plain"})
+    assert resp.status_code == 422

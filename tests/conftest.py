@@ -114,6 +114,7 @@ class FakeWise:
         self.funded = []
         self.cancelled = []
         self.statuses = {}  # transfer id -> status at Wise
+        self.create_transfer_retry = []  # retry flag of each create_transfer
         self.fail = set()  # names of methods that should fail
         self.fund_response_lost = False  # funds, then fails like a timeout
         self.transfer_id_override = None
@@ -133,8 +134,9 @@ class FakeWise:
         self.recipients.append((full_name, iban))
         return 42
 
-    async def create_transfer(self, target_account_id, quote_id):
+    async def create_transfer(self, target_account_id, quote_id, retry=True):
         self._maybe_fail("create_transfer")
+        self.create_transfer_retry.append(retry)
         transfer_id = self.transfer_id_override
         if transfer_id is None:
             transfer_id = next(self._ids)
