@@ -28,7 +28,11 @@ async def lifespan(app: FastAPI):
     await database.disconnect()
 
 
-app = FastAPI(lifespan=lifespan)
+# strict_content_type=False: a JSON body sent without a Content-Type header is
+# still parsed, as before the FastAPI upgrade. FastAPI's strict default guards
+# against cross-site requests made with the user's cookies; this API uses
+# bearer tokens, which another site can't make the browser send.
+app = FastAPI(lifespan=lifespan, strict_content_type=False)
 app.include_router(api_router)
 # Added before CORS so CORS stays outermost and 413 responses get CORS headers
 app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BYTES)

@@ -2,11 +2,15 @@ import logging
 import uuid
 from functools import lru_cache
 
+import anyio
 import httpx
 from decouple import config
 from fastapi import HTTPException
 
 REQUEST_TIMEOUT = 10  # seconds
+# Waits between attempts of requests that are safe to repeat
+RETRY_DELAYS = (0.5, 2)  # seconds
+MAX_RETRY_AFTER = 5  # seconds; longer Retry-After values are not waited for
 
 # Wise transfer statuses (GET /v1/transfers/{id})
 UNFUNDED = "incoming_payment_waiting"
@@ -34,6 +38,15 @@ def _error_summary(resp):
     return "no error code"
 
 
+def _retry_after(resp, default):
+    """Seconds to wait as asked by a 429 response, or None if that's too long."""
+    try:
+        delay = float(resp.headers["Retry-After"])
+    except (KeyError, ValueError):
+        return default
+    return max(delay, 0) if delay <= MAX_RETRY_AFTER else None
+
+
 class WiseService:
     def __init__(self, transport=None):
         # transport lets tests replace the network with httpx.MockTransport
@@ -45,18 +58,47 @@ class WiseService:
         }
         self._profile_id = None
 
-    async def _request(self, method, path, expected_status, json=None):
-        try:
-            async with httpx.AsyncClient(
-                base_url=self.main_url,
-                headers=self.headers,
-                timeout=REQUEST_TIMEOUT,
-                transport=self.transport,
-            ) as client:
-                resp = await client.request(method, path, json=json)
-        except httpx.HTTPError:
-            logger.exception("Wise request %s %s failed", method, path)
-            raise HTTPException(502, "Payment provider is not available at the moment")
+    async def _send(self, method, path, json):
+        async with httpx.AsyncClient(
+            base_url=self.main_url,
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT,
+            transport=self.transport,
+        ) as client:
+            return await client.request(method, path, json=json)
+
+    async def _request(self, method, path, expected_status, json=None, retry=False):
+        # retry: only for requests Wise handles at most once (reads, and
+        # transfer creation with the same customerTransactionId)
+        delays = list(RETRY_DELAYS) if retry else []
+        while True:
+            try:
+                resp = await self._send(method, path, json)
+            except httpx.HTTPError:
+                if not delays:
+                    logger.exception("Wise request %s %s failed", method, path)
+                    raise HTTPException(
+                        502, "Payment provider is not available at the moment"
+                    )
+                logger.warning(
+                    "Wise request %s %s failed, retrying", method, path, exc_info=True
+                )
+                await anyio.sleep(delays.pop(0))
+                continue
+            if delays and (resp.status_code == 429 or resp.status_code >= 500):
+                delay = delays.pop(0)
+                if resp.status_code == 429:
+                    delay = _retry_after(resp, default=delay)
+                if delay is not None:
+                    logger.warning(
+                        "Wise request %s %s returned %s, retrying",
+                        method,
+                        path,
+                        resp.status_code,
+                    )
+                    await anyio.sleep(delay)
+                    continue
+            break
         if resp.status_code != expected_status:
             logger.error(
                 "Wise request %s %s returned %s: %s",
@@ -75,7 +117,7 @@ class WiseService:
     async def get_profile_id(self):
         # Looked up on first use so the app can start without reaching Wise
         if self._profile_id is None:
-            profiles = await self._request("GET", "/v1/profiles", 200)
+            profiles = await self._request("GET", "/v1/profiles", 200, retry=True)
             personal = [el["id"] for el in profiles if el["type"].lower() == "personal"]
             if not personal:
                 logger.error("Wise account has no personal profile")
@@ -108,17 +150,34 @@ class WiseService:
         return resp["id"]
 
     async def create_transfer(self, target_account_id, quote_id):
+        # Wise creates at most one transfer per customerTransactionId, so the
+        # request is retried with the same id: a timeout whose transfer was
+        # created anyway then returns that transfer instead of losing track
+        # of it
+        customer_transaction_id = str(uuid.uuid4())
         data = {
             "targetAccount": target_account_id,
             "quoteUuid": quote_id,
-            "customerTransactionId": str(uuid.uuid4()),
+            "customerTransactionId": customer_transaction_id,
             "details": {},
         }
-        resp = await self._request("POST", "/v1/transfers", 200, json=data)
+        try:
+            resp = await self._request(
+                "POST", "/v1/transfers", 200, json=data, retry=True
+            )
+        except HTTPException:
+            # Wise may still have created it; this id finds it in Wise
+            logger.error(
+                "Creating Wise transfer with customerTransactionId %s failed",
+                customer_transaction_id,
+            )
+            raise
         return resp["id"]
 
     async def get_transfer_status(self, transfer_id):
-        resp = await self._request("GET", f"/v1/transfers/{transfer_id}", 200)
+        resp = await self._request(
+            "GET", f"/v1/transfers/{transfer_id}", 200, retry=True
+        )
         return resp.get("status")
 
     async def fund_transfer(self, transfer_id):

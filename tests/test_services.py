@@ -125,6 +125,130 @@ def test_wise_without_personal_profile(monkeypatch):
         run(service.get_profile_id())
 
 
+@pytest.fixture
+def sleeps(monkeypatch):
+    waited = []
+
+    async def fake_sleep(delay):
+        waited.append(delay)
+
+    monkeypatch.setattr("anyio.sleep", fake_sleep)
+    return waited
+
+
+def test_wise_transfer_creation_survives_lost_response(monkeypatch, sleeps):
+    # Wise creates the transfer but the response times out; the retry with
+    # the same customerTransactionId returns that transfer, not a new one
+    transfers = {}
+    calls = []
+
+    def handler(request):
+        if request.url.path == "/v1/profiles":
+            return httpx.Response(200, json=PROFILES)
+        key = json.loads(request.content)["customerTransactionId"]
+        calls.append(key)
+        created = key in transfers
+        transfers.setdefault(key, 1000 + len(transfers))
+        if not created:
+            raise httpx.ReadTimeout("response lost")
+        return httpx.Response(200, json={"id": transfers[key]})
+
+    service = wise(handler, monkeypatch)
+
+    assert run(service.create_transfer(42, "quote-1")) == 1000
+    assert len(transfers) == 1
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_wise_transfer_creation_retries_server_errors(monkeypatch, sleeps, status):
+    answers = iter([httpx.Response(status), httpx.Response(200, json={"id": 7})])
+    service = wise(lambda request: next(answers), monkeypatch)
+    assert run(service.create_transfer(42, "quote-1")) == 7
+
+
+def test_wise_retry_honours_short_retry_after(monkeypatch, sleeps):
+    answers = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "3"}),
+            httpx.Response(200, json={"id": 7}),
+        ]
+    )
+    service = wise(lambda request: next(answers), monkeypatch)
+    assert run(service.create_transfer(42, "quote-1")) == 7
+    assert sleeps == [3.0]
+
+
+def test_wise_long_retry_after_is_not_waited_for(monkeypatch, sleeps):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "60"})
+
+    with pytest.raises(HTTPException):
+        run(wise(handler, monkeypatch).create_transfer(42, "quote-1"))
+    assert len(requests) == 1 and sleeps == []
+
+
+def test_wise_gives_up_after_retries_and_logs_the_id(monkeypatch, sleeps, caplog):
+    keys = []
+
+    def handler(request):
+        keys.append(json.loads(request.content)["customerTransactionId"])
+        raise httpx.ConnectTimeout("down")
+
+    with pytest.raises(HTTPException) as ex:
+        run(wise(handler, monkeypatch).create_transfer(42, "quote-1"))
+    assert ex.value.status_code == 502
+    assert len(keys) == 3 and len(set(keys)) == 1
+    assert keys[0] in caplog.text
+
+
+def test_wise_client_errors_are_not_retried(monkeypatch, sleeps):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(400, json={"errors": [{"code": "NOT_VALID"}]})
+
+    with pytest.raises(HTTPException):
+        run(wise(handler, monkeypatch).create_transfer(42, "quote-1"))
+    assert len(requests) == 1
+
+
+def test_wise_requests_that_could_repeat_an_action_are_not_retried(monkeypatch, sleeps):
+    # A second quote, recipient, payment or cancel request isn't deduplicated
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        if request.url.path == "/v1/profiles":
+            return httpx.Response(200, json=PROFILES)
+        raise httpx.ReadTimeout("response lost")
+
+    service = wise(handler, monkeypatch)
+    for call in (
+        service.create_quote(5),
+        service.create_recipient_account("Jane Doe", "DE89370400440532013000"),
+        service.fund_transfer(99),
+        service.cancel_transfer(99),
+    ):
+        with pytest.raises(HTTPException):
+            run(call)
+    assert requests.count("/v1/profiles") == 1
+    assert len(requests) == 5  # profile lookup + one attempt each
+
+
+def test_wise_status_lookup_is_retried(monkeypatch, sleeps):
+    answers = iter(
+        [httpx.Response(503), httpx.Response(200, json={"status": "processing"})]
+    )
+    service = wise(lambda request: next(answers), monkeypatch)
+    assert run(service.get_transfer_status(99)) == "processing"
+
+
 def test_s3_presigned_url(monkeypatch):
     for name, value in {
         "AWS_ACCESS_KEY": "AKIAEXAMPLE",
