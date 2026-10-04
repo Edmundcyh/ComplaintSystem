@@ -332,6 +332,10 @@ def test_approver_cannot_decide_own_complaint(
     assert fakes.wise.funded == [] and fakes.wise.cancelled == []
     [row] = get_row(engine, "SELECT status FROM complaints")
     assert row["status"] == "pending"
+    # Their queue only shows what they can decide
+    other = create_complaint(make_user())
+    resp = client.get("/complaints/", headers=user["headers"])
+    assert [c["id"] for c in resp.json()] == [other["id"]]
 
 
 def test_legacy_iban_is_sent_without_spaces(
@@ -345,10 +349,11 @@ def test_legacy_iban_is_sent_without_spaces(
     assert fakes.wise.recipients == [("Jane Doe", "DE89370400440532013000")]
 
 
-def test_account_without_iban_cannot_file(client, engine, fakes, make_user):
+@pytest.mark.parametrize("iban", [None, "   "])
+def test_account_without_iban_cannot_file(client, engine, fakes, make_user, iban):
     user = make_user()
     with engine.begin() as conn:
-        conn.execute(sa.text("UPDATE users SET iban = NULL"))
+        conn.execute(sa.text("UPDATE users SET iban = :iban"), {"iban": iban})
     resp = client.post("/complaints/", json=complaint_body(), headers=user["headers"])
     assert resp.status_code == 400
     assert fakes.wise.quotes == [] and fakes.s3.uploaded == {}

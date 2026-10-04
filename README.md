@@ -5,8 +5,8 @@ amount they want refunded), approvers approve or reject them, and approved
 refunds are paid out through [Wise](https://wise.com).
 
 - **Complainers** register, file complaints and see their own complaints.
-- **Approvers** see pending complaints and approve or reject them (never
-  their own).
+- **Approvers** see other people's pending complaints and approve or reject
+  them (never their own).
 - **Admins** see everything, delete complaints and manage other users' roles.
 
 When a complaint is filed, its photo is stored privately in S3 and a Wise

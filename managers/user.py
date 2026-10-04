@@ -74,9 +74,21 @@ class UserManager:
         if user_id == admin["id"]:
             # Otherwise an admin can lock everyone out by demoting themselves
             raise HTTPException(400, "You cannot change your own role")
-        user_do = await database.fetch_one(user.select().where(user.c.id == user_id))
-        if not user_do:
-            raise HTTPException(404, "User not found")
-        await database.execute(
-            user.update().where(user.c.id == user_id).values(role=role)
-        )
+        async with database.transaction():
+            # Both rows are locked (in id order, so two requests can't
+            # deadlock) and the admin's role is read again under the lock:
+            # of two admins demoting each other at the same time, only the
+            # first succeeds, so there is always an admin left
+            rows = {}
+            for id_ in sorted((admin["id"], user_id)):
+                rows[id_] = await database.fetch_one(
+                    user.select().where(user.c.id == id_).with_for_update()
+                )
+            admin_do = rows[admin["id"]]
+            if not admin_do or admin_do["role"] != RoleType.admin:
+                raise HTTPException(403, "Forbidden")
+            if not rows[user_id]:
+                raise HTTPException(404, "User not found")
+            await database.execute(
+                user.update().where(user.c.id == user_id).values(role=role)
+            )

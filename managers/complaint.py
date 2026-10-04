@@ -24,12 +24,17 @@ class ComplaintManager:
         if user["role"] == RoleType.complainer:
             q = q.where(complaint.c.complainer_id == user["id"])
         elif user["role"] == RoleType.approver:
-            q = q.where(complaint.c.status == State.pending)
+            # Only what they can decide: not their own (see _check_not_own)
+            q = q.where(
+                complaint.c.status == State.pending,
+                complaint.c.complainer_id != user["id"],
+            )
         return [ComplaintManager._present(c, s3) for c in await database.fetch_all(q)]
 
     @staticmethod
     async def create_complaint(complaint_data, user, s3, wise):
-        if not user["iban"]:
+        iban = ComplaintManager._payout_iban(user)
+        if not iban:
             # Registration requires an IBAN; only accounts created by hand lack one
             raise HTTPException(400, "The account has no IBAN to pay the refund to")
         complaint_data["complainer_id"] = user["id"]
@@ -48,7 +53,7 @@ class ComplaintManager:
                 wise,
                 complaint_data["amount"],
                 f"{user['first_name']} {user['last_name']}",
-                user["iban"],
+                iban,
             )
         except Exception:
             await ComplaintManager._undo(s3.delete_photo, name)
@@ -167,8 +172,7 @@ class ComplaintManager:
     @staticmethod
     async def issue_transaction(wise, amount, full_name, iban, retry=True):
         quote_id = await wise.create_quote(amount)
-        # IBANs saved before they were validated may still contain spaces
-        recipient_id = await wise.create_recipient_account(full_name, strip_iban(iban))
+        recipient_id = await wise.create_recipient_account(full_name, iban)
         transfer_id = await wise.create_transfer(recipient_id, quote_id, retry=retry)
         return {
             "quote_id": quote_id,
@@ -179,7 +183,8 @@ class ComplaintManager:
 
     @staticmethod
     async def _replace_transfer(transaction_do, complaint_do, complainer, wise):
-        if not complainer["iban"]:
+        iban = ComplaintManager._payout_iban(complainer)
+        if not iban:
             raise HTTPException(
                 409, "The complainer has no IBAN; the refund needs manual attention"
             )
@@ -189,7 +194,7 @@ class ComplaintManager:
             wise,
             complaint_do["amount"],
             f"{complainer['first_name']} {complainer['last_name']}",
-            complainer["iban"],
+            iban,
             retry=False,
         )
         await database.execute(
@@ -226,6 +231,12 @@ class ComplaintManager:
                 f"The refund transfer is '{status}' at Wise and needs manual attention",
             )
         return None
+
+    @staticmethod
+    def _payout_iban(user_do):
+        # IBANs saved before they were validated may contain spaces (or be
+        # missing); returns "" if there is nothing to pay to
+        return strip_iban(user_do["iban"] or "")
 
     @staticmethod
     def _check_not_own(complaint_do, approver):
