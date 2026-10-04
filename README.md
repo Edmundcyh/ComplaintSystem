@@ -5,8 +5,9 @@ amount they want refunded), approvers approve or reject them, and approved
 refunds are paid out through [Wise](https://wise.com).
 
 - **Complainers** register, file complaints and see their own complaints.
-- **Approvers** see pending complaints and approve or reject them.
-- **Admins** see everything, delete complaints and manage user roles.
+- **Approvers** see pending complaints and approve or reject them (never
+  their own).
+- **Admins** see everything, delete complaints and manage other users' roles.
 
 When a complaint is filed, its photo is stored privately in S3 and a Wise
 transfer for the refund is prepared. Approving funds that transfer and emails
@@ -68,9 +69,11 @@ Admins can then promote other users with `PUT /users/{id}/make-approver` or
 | PUT | `/complaints/{id}/reject` | approver | Cancel the refund |
 | DELETE | `/complaints/{id}/` | admin | Delete the complaint and its photo (cancels the refund if still pending) |
 | GET | `/users/?email=` | admin | List users, optionally by email |
-| PUT | `/users/{id}/make-admin`, `/users/{id}/make-approver` | admin | Change a role |
+| PUT | `/users/{id}/make-admin`, `/users/{id}/make-approver` | admin | Change another user's role |
 
 Send the token as `Authorization: Bearer <token>`; tokens last 2 hours.
+Email addresses are case-insensitive: they are stored in lower case and
+`Jane@Example.com` logs in to the same account as `jane@example.com`.
 
 Send JSON with `Content-Type: application/json` (a request without a
 `Content-Type` header is also read as JSON; other content types get `422`).
@@ -97,7 +100,9 @@ so fetch complaints again rather than storing it.
   rule that expires noncurrent versions, or deleted photos are kept.
 - Run `alembic upgrade head`. It converts amounts to exact decimals (rounded
   to 2 places) and stops with a list of rows if any amount is too large
-  (100,000,000 or more) or not a number; correct those and run it again.
+  (100,000,000 or more) or not a number; correct those and run it again. It
+  also lowercases all email addresses and stops with a list of accounts if two
+  of them differ only by case; remove or change all but one of each first.
 - Everyone has to log in again: tokens issued by the old version are no longer
   accepted.
 - New passwords are limited to 72 bytes (bcrypt ignores the rest); existing

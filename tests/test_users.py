@@ -1,3 +1,6 @@
+import sqlalchemy as sa
+
+
 def test_admin_can_list_and_filter_users(client, make_user):
     admin = make_user("admin")
     user = make_user()
@@ -24,6 +27,21 @@ def test_admin_can_change_roles(client, make_user):
             "/users/", params={"email": user["email"]}, headers=admin["headers"]
         )
         assert resp.json()[0]["role"] == role
+
+
+def test_change_role_of_unknown_user(client, make_user):
+    admin = make_user("admin")
+    resp = client.put("/users/999/make-approver", headers=admin["headers"])
+    assert resp.status_code == 404
+
+
+def test_admin_cannot_change_own_role(client, engine, make_user):
+    admin = make_user("admin")
+    resp = client.put(f"/users/{admin['id']}/make-approver", headers=admin["headers"])
+    assert resp.status_code == 400
+    with engine.begin() as conn:
+        role = conn.execute(sa.text("SELECT role FROM users")).scalar_one()
+    assert role == "admin"
 
 
 def test_non_admins_cannot_manage_users(client, make_user):

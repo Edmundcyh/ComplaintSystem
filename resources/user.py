@@ -1,6 +1,7 @@
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends
+from starlette.requests import Request
 
 from managers.auth import oauth2_scheme, is_admin
 from managers.user import UserManager
@@ -27,8 +28,8 @@ async def get_user(email: Optional[str] = None):
     dependencies=[Depends(oauth2_scheme), Depends(is_admin)],
     status_code=204,
 )
-async def make_admin(user_id: Id):
-    await UserManager.change_role(RoleType.admin, user_id)
+async def make_admin(request: Request, user_id: Id):
+    await UserManager.change_role(RoleType.admin, user_id, request.state.user)
 
 
 @router.put(
@@ -36,5 +37,5 @@ async def make_admin(user_id: Id):
     dependencies=[Depends(oauth2_scheme), Depends(is_admin)],
     status_code=204,
 )
-async def make_approver(user_id: Id):
-    await UserManager.change_role(RoleType.approver, user_id)
+async def make_approver(request: Request, user_id: Id):
+    await UserManager.change_role(RoleType.approver, user_id, request.state.user)
