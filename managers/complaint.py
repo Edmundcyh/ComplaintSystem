@@ -9,6 +9,7 @@ from models import complaint, RoleType, State, transaction, user
 from services.s3 import photo_key
 from services.wise import CANCELLED, FUNDED, UNFUNDED
 from utils.helpers import decode_photo
+from utils.validators import strip_iban
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,19 @@ class ComplaintManager:
         if user["role"] == RoleType.complainer:
             q = q.where(complaint.c.complainer_id == user["id"])
         elif user["role"] == RoleType.approver:
-            q = q.where(complaint.c.status == State.pending)
+            # Only what they can decide: not their own (see _check_not_own)
+            q = q.where(
+                complaint.c.status == State.pending,
+                complaint.c.complainer_id != user["id"],
+            )
         return [ComplaintManager._present(c, s3) for c in await database.fetch_all(q)]
 
     @staticmethod
     async def create_complaint(complaint_data, user, s3, wise):
+        iban = ComplaintManager._payout_iban(user)
+        if not iban:
+            # Registration requires an IBAN; only accounts created by hand lack one
+            raise HTTPException(400, "The account has no IBAN to pay the refund to")
         complaint_data["complainer_id"] = user["id"]
         encoded_photo = complaint_data.pop("encoded_photo")
         extension = complaint_data.pop("extension")
@@ -44,7 +53,7 @@ class ComplaintManager:
                 wise,
                 complaint_data["amount"],
                 f"{user['first_name']} {user['last_name']}",
-                user["iban"],
+                iban,
             )
         except Exception:
             await ComplaintManager._undo(s3.delete_photo, name)
@@ -91,13 +100,14 @@ class ComplaintManager:
             )
 
     @staticmethod
-    async def approve(id_, wise, ses):
+    async def approve(id_, approver, wise, ses):
         # The row lock is held while calling Wise so the same complaint
         # cannot be approved or rejected twice concurrently. If funding
         # fails, the status update is rolled back and stays pending.
         for _ in range(2):
             async with database.transaction():
                 complaint_do = await ComplaintManager._get_pending_for_update(id_)
+                ComplaintManager._check_not_own(complaint_do, approver)
                 transaction_do = await ComplaintManager._get_transaction(id_)
                 if not transaction_do:
                     raise HTTPException(409, "Complaint has no payment transaction")
@@ -146,9 +156,10 @@ class ComplaintManager:
             logger.exception("Failed to send approval email for complaint %s", id_)
 
     @staticmethod
-    async def reject(id_, wise):
+    async def reject(id_, approver, wise):
         async with database.transaction():
-            await ComplaintManager._get_pending_for_update(id_)
+            complaint_do = await ComplaintManager._get_pending_for_update(id_)
+            ComplaintManager._check_not_own(complaint_do, approver)
             transfer_id = await ComplaintManager._transfer_to_cancel(id_, wise)
             if transfer_id:
                 await wise.cancel_transfer(transfer_id)
@@ -172,13 +183,18 @@ class ComplaintManager:
 
     @staticmethod
     async def _replace_transfer(transaction_do, complaint_do, complainer, wise):
+        iban = ComplaintManager._payout_iban(complainer)
+        if not iban:
+            raise HTTPException(
+                409, "The complainer has no IBAN; the refund needs manual attention"
+            )
         # Runs under the row lock, so a failed attempt isn't retried (the
         # customerTransactionId is logged if Wise may have created it)
         new = await ComplaintManager.issue_transaction(
             wise,
             complaint_do["amount"],
             f"{complainer['first_name']} {complainer['last_name']}",
-            complainer["iban"],
+            iban,
             retry=False,
         )
         await database.execute(
@@ -215,6 +231,19 @@ class ComplaintManager:
                 f"The refund transfer is '{status}' at Wise and needs manual attention",
             )
         return None
+
+    @staticmethod
+    def _payout_iban(user_do):
+        # IBANs saved before they were validated may contain spaces (or be
+        # missing); returns "" if there is nothing to pay to
+        return strip_iban(user_do["iban"] or "")
+
+    @staticmethod
+    def _check_not_own(complaint_do, approver):
+        # Roles can change after a complaint is filed, so an approver may own
+        # pending complaints; they must not be able to pay themselves
+        if complaint_do["complainer_id"] == approver["id"]:
+            raise HTTPException(403, "You cannot decide your own complaint")
 
     @staticmethod
     def _present(complaint_do, s3):

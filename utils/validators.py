@@ -8,8 +8,9 @@ def check_email(value):
         validate_email(value, check_deliverability=False)
     except EmailNotValidError as ex:
         raise ValueError(str(ex))
-    # Stored as entered, so existing logins keep matching exactly
-    return value
+    # Addresses are treated as case-insensitive (as mail providers do), so
+    # one person can't hold two accounts and logging in with "Jane@..." works
+    return value.lower()
 
 
 def check_password_bytes(value):
@@ -27,9 +28,14 @@ def check_password_bytes(value):
     return value
 
 
+def strip_iban(value):
+    """Remove spaces and uppercase an IBAN, without validating it."""
+    return value.replace(" ", "").upper()
+
+
 def normalize_iban(value):
     """Validate an IBAN's format and check digits; return it without spaces."""
-    iban = value.replace(" ", "").upper()
+    iban = strip_iban(value)
     if not re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}", iban):
         raise ValueError("Invalid IBAN")
     rearranged = iban[4:] + iban[:4]

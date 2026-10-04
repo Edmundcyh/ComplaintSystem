@@ -1,3 +1,9 @@
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import sqlalchemy as sa
+
+
 def test_admin_can_list_and_filter_users(client, make_user):
     admin = make_user("admin")
     user = make_user()
@@ -24,6 +30,43 @@ def test_admin_can_change_roles(client, make_user):
             "/users/", params={"email": user["email"]}, headers=admin["headers"]
         )
         assert resp.json()[0]["role"] == role
+
+
+def test_change_role_of_unknown_user(client, make_user):
+    admin = make_user("admin")
+    resp = client.put("/users/999/make-approver", headers=admin["headers"])
+    assert resp.status_code == 404
+
+
+def test_admin_cannot_change_own_role(client, engine, make_user):
+    admin = make_user("admin")
+    resp = client.put(f"/users/{admin['id']}/make-approver", headers=admin["headers"])
+    assert resp.status_code == 400
+    with engine.begin() as conn:
+        role = conn.execute(sa.text("SELECT role FROM users")).scalar_one()
+    assert role == "admin"
+
+
+def test_admins_cannot_demote_each_other_at_once(client, engine, make_user):
+    alice, bob = make_user("admin"), make_user("admin")
+    pool = ThreadPoolExecutor(2)
+    with engine.begin() as conn:
+        # Hold both rows so the two requests are in flight together
+        conn.execute(sa.text("SELECT id FROM users FOR UPDATE"))
+        futures = [
+            pool.submit(
+                client.put, f"/users/{other['id']}/make-approver", headers=me["headers"]
+            )
+            for me, other in ((alice, bob), (bob, alice))
+        ]
+        time.sleep(0.3)
+    codes = sorted(future.result().status_code for future in futures)
+    pool.shutdown()
+
+    assert codes == [204, 403]
+    with engine.begin() as conn:
+        roles = conn.execute(sa.text("SELECT role FROM users")).scalars().all()
+    assert sorted(roles) == ["admin", "approver"]
 
 
 def test_non_admins_cannot_manage_users(client, make_user):

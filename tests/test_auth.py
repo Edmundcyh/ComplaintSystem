@@ -57,6 +57,35 @@ def test_duplicate_email(client):
     assert register(client).status_code == 201
     resp = register(client)
     assert resp.status_code == 400
+    # Case doesn't make it a different address
+    assert register(client, email="New@Example.COM").status_code == 400
+
+
+def test_email_case_is_ignored(client, engine):
+    assert register(client, email="Jane.Doe@Example.COM").status_code == 201
+    with engine.begin() as conn:
+        email = conn.execute(sa.text("SELECT email FROM users")).scalar_one()
+    assert email == "jane.doe@example.com"
+    for email in ("jane.doe@example.com", "JANE.doe@example.com"):
+        resp = client.post("/login/", json={"email": email, "password": "password123"})
+        assert resp.status_code == 200, email
+
+
+def test_unknown_email_takes_as_long_as_a_wrong_password(client, monkeypatch):
+    # Skipping the password check for unknown emails would reveal, through
+    # the response time, which addresses are registered
+    import managers.user
+
+    checked = []
+    monkeypatch.setattr(
+        managers.user, "verify_password", lambda *args: checked.append(args) or False
+    )
+    resp = client.post(
+        "/login/", json={"email": "nobody@example.com", "password": "password123"}
+    )
+    assert resp.status_code == 400
+    assert len(checked) == 1
+    assert checked[0][1].startswith("$2b$")
 
 
 def test_wrong_credentials(client):

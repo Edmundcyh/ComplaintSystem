@@ -9,6 +9,7 @@ from db import metadata
 from tests.conftest import alembic_config
 
 BEFORE_NUMERIC = "503a98bf8050"
+BEFORE_LOWERCASE = "84c70b91eeac"
 
 
 def test_models_match_migrations(engine):
@@ -58,4 +59,45 @@ def test_numeric_migration_refuses_amounts_that_do_not_fit(engine, amount):
     finally:
         with engine.begin() as conn:
             conn.execute(sa.text("DELETE FROM complaints"))
+        command.upgrade(cfg, "head")
+
+
+def insert_legacy_users(engine, *emails):
+    with engine.begin() as conn:
+        for email in emails:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO users (email, password, role) "
+                    "VALUES (:email, 'x', 'complainer')"
+                ),
+                {"email": email},
+            )
+
+
+def test_email_migration_lowercases(engine):
+    cfg = alembic_config()
+    command.downgrade(cfg, BEFORE_LOWERCASE)
+    try:
+        insert_legacy_users(engine, "Jane.Doe@Example.COM", "bob@example.com")
+        command.upgrade(cfg, "head")
+        with engine.begin() as conn:
+            emails = conn.execute(sa.text("SELECT email FROM users ORDER BY id")).all()
+        assert [row.email for row in emails] == [
+            "jane.doe@example.com",
+            "bob@example.com",
+        ]
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_email_migration_refuses_case_duplicates(engine):
+    cfg = alembic_config()
+    command.downgrade(cfg, BEFORE_LOWERCASE)
+    try:
+        insert_legacy_users(engine, "Jane@example.com", "jane@example.com")
+        with pytest.raises(RuntimeError, match="jane@example.com .user ids 1, 2."):
+            command.upgrade(cfg, "head")
+    finally:
+        with engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM users"))
         command.upgrade(cfg, "head")

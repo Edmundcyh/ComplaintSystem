@@ -61,11 +61,12 @@ async def delete_complaint(
     status_code=204,
 )
 async def approve_complaint(
+    request: Request,
     complaint_id: Id,
     wise: WiseService = Depends(get_wise_service),
     ses: SESService = Depends(get_ses_service),
 ):
-    await ComplaintManager.approve(complaint_id, wise, ses)
+    await ComplaintManager.approve(complaint_id, request.state.user, wise, ses)
 
 
 @router.put(
@@ -74,6 +75,8 @@ async def approve_complaint(
     status_code=204,
 )
 async def reject_complaint(
-    complaint_id: Id, wise: WiseService = Depends(get_wise_service)
+    request: Request,
+    complaint_id: Id,
+    wise: WiseService = Depends(get_wise_service),
 ):
-    await ComplaintManager.reject(complaint_id, wise)
+    await ComplaintManager.reject(complaint_id, request.state.user, wise)

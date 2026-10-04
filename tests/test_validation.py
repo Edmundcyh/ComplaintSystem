@@ -94,8 +94,8 @@ def test_invalid_iban(value):
         normalize_iban(value)
 
 
-def test_check_email_keeps_value():
-    assert check_email("Jane.Doe@Example.COM") == "Jane.Doe@Example.COM"
+def test_check_email_lowercases():
+    assert check_email("Jane.Doe@Example.COM") == "jane.doe@example.com"
     with pytest.raises(ValueError):
         check_email("jane@")
 

@@ -313,6 +313,53 @@ def test_only_approvers_can_approve(client, make_user, create_complaint):
         assert resp.status_code == 403
 
 
+def test_approver_cannot_decide_own_complaint(
+    client, engine, fakes, make_user, create_complaint
+):
+    # A complainer who is later made an approver still owns pending complaints
+    user = make_user()
+    complaint = create_complaint(user)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE users SET role = 'approver' WHERE id = :id"),
+            {"id": user["id"]},
+        )
+    for action in ("approve", "reject"):
+        resp = client.put(
+            f"/complaints/{complaint['id']}/{action}", headers=user["headers"]
+        )
+        assert resp.status_code == 403, action
+    assert fakes.wise.funded == [] and fakes.wise.cancelled == []
+    [row] = get_row(engine, "SELECT status FROM complaints")
+    assert row["status"] == "pending"
+    # Their queue only shows what they can decide
+    other = create_complaint(make_user())
+    resp = client.get("/complaints/", headers=user["headers"])
+    assert [c["id"] for c in resp.json()] == [other["id"]]
+
+
+def test_legacy_iban_is_sent_without_spaces(
+    client, engine, fakes, make_user, create_complaint
+):
+    # Accounts created before IBANs were validated may hold them as typed
+    user = make_user()
+    with engine.begin() as conn:
+        conn.execute(sa.text("UPDATE users SET iban = 'de89 3704 0044 0532 0130 00'"))
+    create_complaint(user)
+    assert fakes.wise.recipients == [("Jane Doe", "DE89370400440532013000")]
+
+
+@pytest.mark.parametrize("iban", [None, "   "])
+def test_account_without_iban_cannot_file(client, engine, fakes, make_user, iban):
+    user = make_user()
+    with engine.begin() as conn:
+        conn.execute(sa.text("UPDATE users SET iban = :iban"), {"iban": iban})
+    resp = client.post("/complaints/", json=complaint_body(), headers=user["headers"])
+    assert resp.status_code == 400
+    assert fakes.wise.quotes == [] and fakes.s3.uploaded == {}
+    assert get_row(engine, "SELECT id FROM complaints") == []
+
+
 # --- reject ---------------------------------------------------------------
 
 
